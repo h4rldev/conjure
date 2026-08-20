@@ -1,3 +1,5 @@
+use super::ui::Ui;
+use indicatif::ProgressBar;
 use miette::{IntoDiagnostic, Result};
 use std::{
   fs,
@@ -5,10 +7,10 @@ use std::{
 };
 
 pub fn cache_dir() -> PathBuf {
-  PathBuf::from(".conjure").join("cache").join("deps")
+  PathBuf::from(".conjure").join("deps")
 }
 
-fn creds() -> git2::RemoteCallbacks<'static> {
+fn creds<'a>() -> git2::RemoteCallbacks<'a> {
   let mut c = git2::RemoteCallbacks::new();
   c.credentials(|_url, username, allowed| {
     if allowed.contains(git2::CredentialType::SSH_KEY) {
@@ -22,14 +24,29 @@ fn creds() -> git2::RemoteCallbacks<'static> {
       return git2::Cred::userpass_plaintext(&user, &token);
     }
 
-    Err(git2::Error::from_str("no supported credential method"))
+    Err(git2::Error::from_str("No supported credential method"))
   });
   c
 }
 
-fn fetch_options() -> git2::FetchOptions<'static> {
+fn fetch_options<'a>(pb: Option<&'a ProgressBar>) -> git2::FetchOptions<'a> {
+  let mut cbs = creds();
+  if let Some(pb) = pb {
+    cbs.transfer_progress(move |stats| {
+      let received = stats.received_objects();
+      let total = stats.total_objects();
+
+      if total > 0 {
+        pb.set_length(total as u64);
+      }
+
+      pb.set_position(received as u64);
+      true
+    });
+  }
+
   let mut fo = git2::FetchOptions::new();
-  fo.remote_callbacks(creds());
+  fo.remote_callbacks(cbs);
   fo
 }
 
@@ -47,44 +64,70 @@ pub fn remote_url(host: &str, path: &str, transport: &str) -> String {
   }
 }
 
-pub fn clone_remote(host: &str, path: &str, transport: &str, name: &str) -> Result<PathBuf> {
-  clone(&remote_url(host, path, transport), name)
-}
-
-pub fn ensure_cloned(url: &str, name: &str) -> Result<PathBuf> {
+pub fn ensure_cloned(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> {
   let dir = cache_dir().join(name);
   if !dir.is_dir() {
     fs::create_dir_all(dir.parent().unwrap()).into_diagnostic()?;
-    let mut builder = git2::build::RepoBuilder::new();
+    let pb = ui.map(|u| u.bar(0, format!("Cloning {name}"), "objects"));
 
-    builder.fetch_options(fetch_options());
-    println!("cloning {url} to {dir:?}");
-    builder.clone(url, &dir).into_diagnostic()?;
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch_options(pb.as_ref()));
+    let result = builder.clone(url, &dir);
+    if let Some(pb) = &pb {
+      match &result {
+        Ok(_) => pb.finish_with_message(format!("✓ Cloned {name}")),
+        Err(_) => pb.finish_with_message(format!("✗ Failed to clone {name}")),
+      }
+    }
+    result.into_diagnostic()?;
   }
   Ok(dir)
 }
 
-pub fn clone(url: &str, name: &str) -> Result<PathBuf> {
-  let dir = ensure_cloned(url, name)?;
-  fetch(url, &dir)?;
+pub fn clone(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> {
+  let dir = ensure_cloned(ui, url, name)?;
+  fetch(ui, url, &dir)?;
   Ok(dir)
 }
 
-fn fetch(url: &str, dir: &Path) -> Result<()> {
+pub fn clone_remote(
+  ui: Option<&Ui>,
+  host: &str,
+  path: &str,
+  transport: &str,
+  name: &str,
+) -> Result<PathBuf> {
+  clone(ui, &remote_url(host, path, transport), name)
+}
+
+fn fetch(ui: Option<&Ui>, url: &str, dir: &Path) -> Result<()> {
   let repo = git2::Repository::open(dir).into_diagnostic()?;
   let mut remote = repo
     .find_remote("origin")
     .or_else(|_| repo.remote("origin", url))
     .into_diagnostic()?;
 
-  remote
-    .fetch(
-      &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-      Some(&mut fetch_options()),
-      None,
+  let pb = ui.map(|u| {
+    u.bar(
+      0,
+      format!("Fetching {}", dir.file_name().unwrap().to_string_lossy()),
+      "objects",
     )
-    .into_diagnostic()?;
+  });
+  let mut fo = fetch_options(pb.as_ref());
+  let result = remote.fetch(
+    &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
+    Some(&mut fo),
+    None,
+  );
 
+  if let Some(pb) = &pb {
+    match &result {
+      Ok(_) => pb.finish_with_message(format!("✓ Fetched {}", dir.display())),
+      Err(_) => pb.finish_with_message(format!("✗ Failed to fetch {}", dir.display())),
+    }
+  }
+  result.into_diagnostic()?;
   Ok(())
 }
 

@@ -39,9 +39,11 @@ where
 ///   convention, such as dynamic or static)
 ///
 ///   compile {
-///     c_flags: [string]
-///     ld_flags: [string]
-///     cc: string
+///     c_flags: [string] (global c_flags used for all profiles)
+///     ld_flags: [string] (global ld_flags used for all profiles)
+///     cc: string (default cc for the project)
+///     linker: string (default linker for the project)
+///     include: [string] (global include directories used for all profiles)
 ///   }
 ///
 ///   sub_projects {
@@ -53,12 +55,16 @@ where
 ///         c_flags: [string]
 ///         ld_flags: [string]
 ///         cc: string
+///         linker: string
+///         include: [string]
 ///       }
 ///       dependencies {
 ///         name: string {
 ///           (remote | local): string (path | codeberg | github | bitbucket | git): string remote: string
 ///           transport: string (ssh | http | https)
-///           build: string (cmake | make | autotools | ninja | meson | xmake)
+///           build: string (cmake | make | autotools | ninja | meson | xmake), string (target, e.g.
+///           release)
+///           include: [string] (optional include path hint to find the dependency's include directory, could be the name of the path, or the path itself)
 ///         }
 ///       }
 ///     }
@@ -66,15 +72,21 @@ where
 ///
 ///   profiles {
 ///     name: string {
-///       c_flags: [string] (preface the flags with replace to replace the default flags for the profile, default is append to the current flags, which can be made explicit with +, add, or append)
+///       c_flags: (optional: replace | append) [string]
 ///       ld_flags: [string] (same as c_flags)
-///       cc: string (path to the compiler, doesnt need to the direct path if its in PATH, omit for default)
-///       linker: string (path to the linker, doesnt need to the direct path if its in PATH, omit for default)
+///       cc: string (path to the compiler, optional)
+///       linker: string (path to the linker, optional)
 ///     }
 ///   }
 ///
 ///   Has the same fields as the dependencies field in sub-projects
 ///   dependencies {}
+///
+///   output {
+///     bin: string (optional: set path for binaries)
+///     lib: string (optional: set path for libraries)
+///     symlink_binaries: bool (optional: set whether to symlink binaries to project root)
+///   }
 /// }
 /// ```
 ///
@@ -188,6 +200,7 @@ pub struct Compile {
   pub cc: Option<String>,
   pub linker: Option<String>,
   pub standard: Option<String>,
+  pub include: Option<Vec<String>>,
   #[serde(default)]
   pub c_flags: Option<Flags>,
   #[serde(default)]
@@ -235,6 +248,12 @@ pub struct Dependency {
   pub transport: Option<Transport>,
   #[serde(default)]
   pub build: Option<BuildSystem>,
+  #[serde(default)]
+  pub include: Option<Vec<String>>,
+  #[serde(default)]
+  pub pkg_config: Option<Vec<String>>,
+  #[serde(default)]
+  pub r#ref: Option<String>,
 }
 
 impl Dependency {
@@ -296,45 +315,67 @@ impl TryFrom<String> for Transport {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(try_from = "String")]
+#[serde(try_from = "Vec<String>")]
 pub enum BuildSystem {
-  Make,
-  CMake,
-  Autotools,
-  Meson,
-  Ninja,
-  Xmake,
+  Make(Option<String>),
+  CMake(Option<String>),
+  Autotools(Option<String>),
+  Meson(Option<String>),
+  Ninja(Option<String>),
+  Xmake(Option<String>),
+  Just(String),
   Custom(String),
 }
 
 impl std::fmt::Display for BuildSystem {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      BuildSystem::Make => write!(f, "make"),
-      BuildSystem::CMake => write!(f, "cmake"),
-      BuildSystem::Autotools => write!(f, "autotools"),
-      BuildSystem::Meson => write!(f, "meson"),
-      BuildSystem::Ninja => write!(f, "ninja"),
-      BuildSystem::Xmake => write!(f, "xmake"),
+      BuildSystem::Make(_target) => {
+        write!(f, "make")
+      }
+      BuildSystem::CMake(_target) => {
+        write!(f, "cmake")
+      }
+      BuildSystem::Autotools(_target) => {
+        write!(f, "autotools")
+      }
+      BuildSystem::Meson(_target) => {
+        write!(f, "meson")
+      }
+      BuildSystem::Ninja(_target) => {
+        write!(f, "ninja")
+      }
+      BuildSystem::Xmake(_target) => {
+        write!(f, "xmake")
+      }
+      BuildSystem::Just(_target) => write!(f, "just"),
       BuildSystem::Custom(cmd) => {
         let cmd_executable = cmd.split_whitespace().next().unwrap();
-        write!(f, "custom({})", cmd_executable)
+        write!(f, "custom ({})", cmd_executable)
       }
     }
   }
 }
 
-impl TryFrom<String> for BuildSystem {
+impl TryFrom<Vec<String>> for BuildSystem {
   type Error = String;
-  fn try_from(s: String) -> Result<Self, Self::Error> {
-    match s.to_ascii_lowercase().as_str() {
-      "make" => Ok(Self::Make),
-      "cmake" => Ok(Self::CMake),
-      "autotools" => Ok(Self::Autotools),
-      "meson" => Ok(Self::Meson),
-      "ninja" => Ok(Self::Ninja),
-      "xmake" => Ok(Self::Xmake),
-      _ => Ok(Self::Custom(s)),
+  fn try_from(v: Vec<String>) -> Result<Self, Self::Error> {
+    let first = v.first().map(|s| s.to_ascii_lowercase());
+    match first.as_deref() {
+      Some("make") => Ok(Self::Make(v.get(1).cloned())),
+      Some("cmake") => Ok(Self::CMake(v.get(1).cloned())),
+      Some("autotools") => Ok(Self::Autotools(v.get(1).cloned())),
+      Some("meson") => Ok(Self::Meson(v.get(1).cloned())),
+      Some("ninja") => Ok(Self::Ninja(v.get(1).cloned())),
+      Some("xmake") => Ok(Self::Xmake(v.get(1).cloned())),
+      Some("just") => Ok(Self::Just(
+        v.get(1)
+          .cloned()
+          .filter(|f| !f.is_empty())
+          .unwrap_or("build".to_string())
+          .to_string(),
+      )),
+      _ => Ok(Self::Custom(v.join(" "))),
     }
   }
 }

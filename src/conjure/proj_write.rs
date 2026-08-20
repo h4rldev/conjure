@@ -89,16 +89,30 @@ impl Serialize for Transport {
   }
 }
 
+fn with_target<S: serde::Serializer>(
+  system: &str,
+  target: &Option<String>,
+  s: S,
+) -> Result<S::Ok, S::Error> {
+  let mut out = vec![system.to_string()];
+  if let Some(t) = target {
+    out.push(t.clone());
+  }
+
+  out.serialize(s)
+}
+
 impl Serialize for BuildSystem {
   fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
     match self {
       Self::Custom(str) => str.serialize(s),
-      Self::Make => "make".serialize(s),
-      Self::CMake => "cmake".serialize(s),
-      Self::Autotools => "autotools".serialize(s),
-      Self::Meson => "meson".serialize(s),
-      Self::Ninja => "ninja".serialize(s),
-      Self::Xmake => "xmake".serialize(s),
+      Self::Make(t) => with_target("make", t, s),
+      Self::CMake(t) => with_target("cmake", t, s),
+      Self::Autotools(t) => with_target("autotools", t, s),
+      Self::Meson(t) => with_target("meson", t, s),
+      Self::Ninja(t) => with_target("ninja", t, s),
+      Self::Xmake(t) => with_target("xmake", t, s),
+      Self::Just(t) => with_target("just", &Some(t.clone()), s),
     }
   }
 }

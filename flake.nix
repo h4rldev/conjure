@@ -15,6 +15,13 @@
       buildInputs = with pkgs; [
         pkg-config
         openssl
+        cmake
+
+        ### For the test project.
+        mold
+        libuv
+        openssl.dev
+        zlib
       ];
     };
   };

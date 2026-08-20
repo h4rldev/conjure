@@ -1,9 +1,9 @@
 use super::{
-  build, git, lock, proj,
+  build, compile, git, lock, proj,
   proj_parse::{self, Compile, Flags, Profile, Project, ProjectType, slugify},
   proj_write::fix_braces,
+  ui::{StepStatus, Ui},
 };
-
 use clap::{
   Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
   builder::{Styles, styling::AnsiColor},
@@ -57,6 +57,9 @@ enum Commands {
   Update(UpdateArgs),
   /// Build the project
   Build(BuildArgs),
+  /// Generate a compile_commands.json for clangd
+  #[command(name = "compile-commands")]
+  Compile(CompileCommandsArgs),
   /// Run a subcommand as a specific profile
   As(AsArgs),
 }
@@ -115,6 +118,9 @@ struct AddArgs {
   /// Transport to use for getting the dependency
   #[arg(long, value_enum)]
   transport: Option<Transport>,
+  /// Tag, branch, or commit to pin
+  #[arg(long, short = 'r')]
+  r#ref: Option<String>,
   /// Force the addition of the dependency
   #[arg(long)]
   force: bool,
@@ -134,6 +140,12 @@ struct UpdateArgs {
 
 #[derive(Args)]
 struct BuildArgs {
+  #[arg(long, short = 'p')]
+  profile: Option<String>,
+}
+
+#[derive(Args)]
+struct CompileCommandsArgs {
   #[arg(long, short = 'p')]
   profile: Option<String>,
 }
@@ -183,28 +195,58 @@ enum LocalOrRemote {
   Git,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, Default)]
 enum Language {
   #[value(alias = "c")]
+  #[default]
   C,
   #[value(alias = "c++")]
   Cpp,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, Default)]
 enum TypeType {
   #[value(alias = "binary")]
+  #[default]
   Binary,
   #[value(alias = "library")]
   Library,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, Default)]
 enum LinkType {
   #[value(alias = "static")]
   Static,
   #[value(alias = "dynamic")]
+  #[default]
   Dynamic,
+}
+
+impl std::fmt::Display for Language {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Language::C => write!(f, "C"),
+      Language::Cpp => write!(f, "C++"),
+    }
+  }
+}
+
+impl std::fmt::Display for TypeType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      TypeType::Binary => write!(f, "binary"),
+      TypeType::Library => write!(f, "library"),
+    }
+  }
+}
+
+impl std::fmt::Display for LinkType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      LinkType::Static => write!(f, "static"),
+      LinkType::Dynamic => write!(f, "dynamic"),
+    }
+  }
 }
 
 fn project_type(ty: Option<TypeType>, link: Option<LinkType>) -> ProjectType {
@@ -341,9 +383,12 @@ fn edit_dependencies(
   let text = std::fs::read_to_string("conjure.kdl").into_diagnostic()?;
   let mut doc: kdl::KdlDocument = text.parse().into_diagnostic()?;
 
-  let project = doc
-    .get_mut("project")
-    .ok_or_else(|| miette::miette!("no project node in conjure.kdl"))?;
+  let project = doc.get_mut("project").ok_or_else(|| {
+    miette::miette!(
+      help = "Generate a conjure.kdl using `conjure init`",
+      "No project node in conjure.kdl"
+    )
+  })?;
   if project.children_mut().is_none() {
     *project.children_mut() = Some(kdl::KdlDocument::new());
   }
@@ -362,7 +407,10 @@ fn edit_dependencies(
 
   miette::ensure!(
     args.force || children.get(name).is_none(),
-    "dependency `{name}` already exists; Use --force to replace",
+    miette::miette!(
+      help = "Use --force to replace",
+      "Dependency `{name}` already exists"
+    )
   );
 
   if children.get(name).is_none() {
@@ -377,6 +425,10 @@ fn edit_dependencies(
       host.to_possible_value().unwrap().get_name(),
       args.path_or_url,
     )),
+  }
+
+  if let Some(r) = &args.r#ref {
+    frag.push_str(&format!("\n  ref {r}"));
   }
 
   if let Some(t) = &transport {
@@ -396,35 +448,46 @@ fn edit_dependencies(
 }
 
 fn lock_remote(
+  ui: &Ui,
   lock: &mut lock::LockFile,
   name: &str,
-  remote: &proj_parse::Remote,
-  transport: Option<proj_parse::Transport>,
+  dep: &proj_parse::Dependency,
   fetch: bool,
 ) -> Result<()> {
-  let (host, path) = match remote {
-    proj_parse::Remote::Codeberg(p) => ("codeberg", p),
-    proj_parse::Remote::GitHub(p) => ("github", p),
-    proj_parse::Remote::BitBucket(p) => ("bitbucket", p),
-    proj_parse::Remote::Git(p) => ("git", p),
+  let (host, path) = match dep.remote.as_ref() {
+    Some(proj_parse::Remote::Codeberg(p)) => ("codeberg", p),
+    Some(proj_parse::Remote::GitHub(p)) => ("github", p),
+    Some(proj_parse::Remote::BitBucket(p)) => ("bitbucket", p),
+    Some(proj_parse::Remote::Git(p)) => ("git", p),
+    None => unreachable!(),
   };
 
-  let t = match transport {
+  let t = match dep.transport {
     Some(proj_parse::Transport::Ssh) | None => "ssh",
     Some(proj_parse::Transport::Https) => "https",
   };
 
   let dir = if fetch {
-    git::clone_remote(host, path, t, name)?
+    git::clone_remote(Some(ui), host, path, t, name)?
   } else {
-    git::ensure_cloned(&git::remote_url(host, path, t), name)?
+    git::ensure_cloned(Some(ui), &git::remote_url(host, path, t), name)?
   };
+
+  if let Some(r) = &dep.r#ref {
+    git::checkout(&dir, r)?;
+  }
 
   let commit = git::resolve_head(&dir)?;
   let r#ref = git::head_ref(&dir)?;
   git::checkout(&dir, &commit)?;
 
-  lock.lock(name, Some(remote.clone()), transport, r#ref, commit);
+  lock.lock(
+    name,
+    Some(dep.remote.clone().unwrap()),
+    dep.transport,
+    r#ref,
+    commit,
+  );
   Ok(())
 }
 
@@ -437,13 +500,26 @@ fn has_profiles() -> bool {
 
 fn handle_new(args: &NewArgs) -> Result<()> {
   let proj_path = Path::new(".").join(slugify(&args.name));
+  let ui = Ui::new();
   if proj_path.is_dir() {
     miette::ensure!(
       args.force,
-      "`{}` already exists; Use --force to overwrite",
-      args.name
+      miette::miette!(
+        help = "Use --force to overwrite the project",
+        "Project `{}` already exists",
+        args.name
+      )
     );
   }
+
+  let format = format!(
+    "Created project `{}` with language `{}`, standard `{}`, type `{}`, and link `{}`",
+    args.name.clone(),
+    args.language.clone().unwrap_or_default(),
+    args.standard.clone().unwrap_or_default(),
+    args.ty.clone().unwrap_or_default(),
+    args.link.clone().unwrap_or_default()
+  );
 
   proj::make_proj(
     proj_path,
@@ -454,11 +530,15 @@ fn handle_new(args: &NewArgs) -> Result<()> {
       args.ty.clone(),
       args.link.clone(),
     ),
-  )
+  )?;
+
+  ui.println(Some(&StepStatus::Success), format)?;
+  Ok(())
 }
 
 fn handle_init(args: &InitArgs) -> Result<()> {
   let proj_path = Path::new(".");
+  let ui = Ui::new();
   let proj_name = args.name.clone().unwrap_or_else(|| {
     env::current_dir()
       .ok()
@@ -469,9 +549,21 @@ fn handle_init(args: &InitArgs) -> Result<()> {
   if proj_path.join("project.kdl").exists() {
     miette::ensure!(
       args.force,
-      "`{proj_name}` already exists; Use --force to overwrite"
+      miette::miette!(
+        help = "Use --force to overwrite the project",
+        "Project `{proj_name}` already exists"
+      )
     );
   }
+
+  let format = format!(
+    "Created project `{}` with language `{}`, standard `{}`, type `{}`, and link `{}`",
+    proj_name,
+    args.language.clone().unwrap_or_default(),
+    args.standard.clone().unwrap_or_default(),
+    args.ty.clone().unwrap_or_default(),
+    args.link.clone().unwrap_or_default()
+  );
 
   proj::make_proj(
     proj_path,
@@ -482,6 +574,22 @@ fn handle_init(args: &InitArgs) -> Result<()> {
       args.ty.clone(),
       args.link.clone(),
     ),
+  )?;
+
+  ui.println(Some(&StepStatus::Success), format)?;
+  Ok(())
+}
+
+fn dependency_exists(name: &str) -> Result<bool> {
+  let text = std::fs::read_to_string("conjure.kdl").into_diagnostic()?;
+  let doc: KdlDocument = text.parse().into_diagnostic()?;
+  Ok(
+    doc
+      .get("project")
+      .and_then(|p| p.children())
+      .and_then(|c| c.get("dependencies"))
+      .and_then(|d| d.children())
+      .is_some_and(|deps| deps.get(name).is_some()),
   )
 }
 
@@ -493,7 +601,16 @@ fn handle_add(args: &AddArgs) -> Result<()> {
     .unwrap_or(&args.path_or_url)
     .to_string();
 
+  miette::ensure!(
+    args.force || !dependency_exists(&name)?,
+    miette::miette!(
+      help = "Use --force to replace the dependency",
+      "Dependency `{name}` already exists"
+    )
+  );
+
   let transport = args.transport.clone().unwrap_or(Transport::Ssh);
+  let ui = Ui::new();
 
   let (dir, build, transport_name) = match &args.local_or_remote {
     LocalOrRemote::Local => (None, None, None),
@@ -505,7 +622,7 @@ fn handle_add(args: &AddArgs) -> Result<()> {
         .unwrap()
         .get_name()
         .to_string();
-      let dir = git::clone_remote(host_name, &args.path_or_url, &t, &name)?;
+      let dir = git::clone_remote(Some(&ui), host_name, &args.path_or_url, &t, &name)?;
       let build = args
         .build
         .as_ref()
@@ -520,8 +637,11 @@ fn handle_add(args: &AddArgs) -> Result<()> {
   edit_dependencies(args, &name, build, transport_name.clone())?;
 
   if let Some(dir) = dir {
+    if let Some(r) = &args.r#ref {
+      git::checkout(&dir, r)?;
+    }
     let commit = git::resolve_head(&dir)?;
-    let r#ref = git::head_ref(&dir)?;
+    let r#ref = git::head_ref(&dir)?.or_else(|| args.r#ref.clone());
     let remote = Some(match &args.local_or_remote {
       LocalOrRemote::Codeberg => proj_parse::Remote::Codeberg(args.path_or_url.clone()),
       LocalOrRemote::Github => proj_parse::Remote::GitHub(args.path_or_url.clone()),
@@ -539,21 +659,32 @@ fn handle_add(args: &AddArgs) -> Result<()> {
     lock.save("conjure.lock")?;
   }
 
+  ui.println(
+    Some(&StepStatus::Success),
+    format!("Added dependency `{name}`"),
+  )?;
   Ok(())
 }
 
 fn handle_remove(args: &RemoveArgs) -> Result<()> {
   let text = fs::read_to_string("conjure.kdl").into_diagnostic()?;
   let mut doc: KdlDocument = text.parse().into_diagnostic()?;
+  let ui = Ui::new();
 
-  let project = doc
-    .get_mut("project")
-    .ok_or_else(|| miette::miette!("No project node in conjure.kdl, run conjure init first"))?;
+  let project = doc.get_mut("project").ok_or_else(|| {
+    miette::miette!(
+      help = "Use `conjure init` to generate a new conjure.kdl",
+      "No project node in conjure.kdl"
+    )
+  })?;
 
   let project_children = project
     .children_mut()
     .as_mut()
-    .ok_or_else(|| miette::miette!("No children in project node, is your project malformed?"))?;
+    .ok_or_else(|| miette::miette!(
+      help = "Verify the conjure.kdl to make sure nothing is wrong, try to generate a new one using `conjure init`", 
+      "No children in project node, is your project malformed?"
+    ))?;
 
   let deps = project_children
     .get_mut("dependencies")
@@ -566,8 +697,11 @@ fn handle_remove(args: &RemoveArgs) -> Result<()> {
 
   miette::ensure!(
     deps_children.get(&args.name).is_some(),
-    "dependency `{}` not found",
-    args.name
+    miette::miette!(
+      help = "Double check if the dependency exists, if not, use `conjure add` to add it",
+      "Dependency `{}` not found",
+      args.name
+    )
   );
 
   deps_children
@@ -592,12 +726,18 @@ fn handle_remove(args: &RemoveArgs) -> Result<()> {
     fs::remove_dir_all(dir).into_diagnostic()?;
   }
 
+  ui.println(
+    Some(&StepStatus::Success),
+    format!("Removed dependency `{}`", args.name),
+  )?;
   Ok(())
 }
 
 fn handle_lock() -> Result<()> {
   let project = proj_parse::Project::from_file("conjure.kdl")?;
   let mut lock = lock::LockFile::load("conjure.lock")?;
+  let ui = Ui::new();
+  let mut deps_list: Vec<String> = vec![];
 
   lock.retain(|name| {
     project
@@ -608,41 +748,56 @@ fn handle_lock() -> Result<()> {
 
   if let Some(deps) = &project.dependencies {
     for (name, dep) in deps.iter().filter(|(_, d)| d.remote.is_some()) {
-      lock_remote(
-        &mut lock,
-        name,
-        dep.remote.as_ref().unwrap(),
-        dep.transport,
-        false,
-      )?;
+      deps_list.push(name.clone());
+      ui.wrap(format!("Locking {name}"), || {
+        lock_remote(&ui, &mut lock, name, dep, false)
+      })?;
     }
+  } else {
+    ui.println(Some(&StepStatus::Failure), "No dependencies to lock")?;
+    return Ok(());
   }
 
   lock.save("conjure.lock")?;
+  ui.println(
+    Some(&StepStatus::Success),
+    format!("Locked dependencies {}", deps_list.join(", ")),
+  )?;
   Ok(())
 }
 
 fn handle_update(args: &UpdateArgs) -> Result<()> {
+  let project = proj_parse::Project::from_file("conjure.kdl")?;
   let mut lock = lock::LockFile::load("conjure.lock")?;
+  let ui = Ui::new();
 
-  let entries: Vec<_> = lock
+  let names: Vec<String> = lock
     .entries()
-    .iter()
-    .filter(|(name, d)| d.remote.is_some() && args.name.as_ref().is_none_or(|want| want == *name))
-    .map(|(name, d)| (name.clone(), d.remote.clone().unwrap(), d.transport))
+    .keys()
+    .filter(|name| args.name.as_ref().is_none_or(|want| want == *name))
+    .cloned()
     .collect();
 
   miette::ensure!(
-    args.name.is_none() || !entries.is_empty(),
-    "dependency `{}` is not locked",
-    args.name.as_ref().unwrap()
+    !names.is_empty(),
+    miette::miette!(
+      help = "Try to run `conjure lock` to lock the dependencies",
+      "Dependencies are not locked"
+    )
   );
 
-  for (name, remote, transport) in entries {
-    lock_remote(&mut lock, &name, &remote, transport, true)?;
+  for name in names {
+    let dep = project
+      .dependencies
+      .as_ref()
+      .and_then(|d| d.get(&name))
+      .ok_or_else(|| miette::miette!("dependency `{name}` not found in conjure.kdl"))?;
+    ui.wrap(format!("updating {name}"), || {
+      lock_remote(&ui, &mut lock, &name, dep, true)
+    })?;
   }
-
   lock.save("conjure.lock")?;
+  ui.println(Some(&StepStatus::Success), "lockfile updated")?;
   Ok(())
 }
 
@@ -667,6 +822,36 @@ fn handle_build(args: &BuildArgs) -> Result<()> {
   };
 
   build::build(&project, profile)
+}
+
+fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
+  let project = Project::from_file("conjure.kdl")?;
+  let ui = Ui::new();
+
+  let profile_name = args
+    .profile
+    .clone()
+    .or_else(|| std::env::var("CONJURE_PROFILE").ok());
+  let profile = match profile_name.as_deref() {
+    Some(name) => {
+      let profiles = project
+        .profiles
+        .as_ref()
+        .ok_or_else(|| miette::miette!("no profiles in conjure.kdl"))?;
+      let p = profiles
+        .get(name)
+        .ok_or_else(|| miette::miette!("profile `{name}` not found"))?;
+      Some((name, p))
+    }
+    None => None,
+  };
+
+  compile::compile_commands(&project, profile)?;
+  ui.println(
+    Some(&StepStatus::Success),
+    "Generated compile_commands.json",
+  )?;
+  Ok(())
 }
 
 fn handle_as(args: &AsArgs) -> Result<()> {
@@ -709,6 +894,7 @@ fn run_command(cmd: &Commands) -> Result<()> {
     Commands::Lock => handle_lock()?,
     Commands::Update(args) => handle_update(args)?,
     Commands::Build(args) => handle_build(args)?,
+    Commands::Compile(args) => handle_compile_commands(args)?,
     Commands::As(_) => unreachable!(),
   }
   Ok(())

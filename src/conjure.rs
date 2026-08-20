@@ -1,7 +1,13 @@
 pub(crate) mod build;
 pub(crate) mod cli;
+pub(crate) mod compile;
+pub(crate) mod dep_cache;
+pub(crate) mod deps;
+pub(crate) mod fingerprint;
 pub(crate) mod git;
+pub(crate) mod link;
 pub(crate) mod lock;
 pub(crate) mod proj;
 pub(crate) mod proj_parse;
 pub(crate) mod proj_write;
+pub(crate) mod ui;
