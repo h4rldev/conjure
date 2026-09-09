@@ -23,6 +23,11 @@ where
   Ok(slugify(&String::deserialize(d)?))
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ProjectKDL {
+  pub project: Project,
+}
+
 /// The project file format
 ///
 /// # Schema
@@ -39,62 +44,58 @@ where
 ///   convention, such as dynamic or static)
 ///
 ///   compile {
-///     c_flags: [string] (global c_flags used for all profiles)
-///     ld_flags: [string] (global ld_flags used for all profiles)
-///     cc: string (default cc for the project)
-///     linker: string (default linker for the project)
-///     include: [string] (global include directories used for all profiles)
+///     src: [string] (source roots: directories to recurse or exact files; defaults to ["src"])
+///     cc: string (path to the compiler, defaults to cc)
+///     linker: string (path to the linker, defaults to the compiler)
+///     standard: string (e.g. "c11", "gnu17", "c++20")
+///     include: [string] (include dirs, each becomes -I<dir>)
+///     c_flags: [string]
+///     ld_flags: [string]
+///     threads: int (parallelism for compiling and dep builds)
 ///   }
 ///
-///   sub_projects {
-///     name path: string (Basic sub-project (only works if the sub-project is a clojure project))
-///     name path {
-///       type: string (matches any known type of project such as binary, library, followed by link
-///       convention, such as dynamic or static)
-///       compile {
-///         c_flags: [string]
-///         ld_flags: [string]
-///         cc: string
-///         linker: string
-///         include: [string]
-///       }
-///       dependencies {
-///         name: string {
-///           (remote | local): string (path | codeberg | github | bitbucket | git): string remote: string
-///           transport: string (ssh | http | https)
-///           build: string (cmake | make | autotools | ninja | meson | xmake), string (target, e.g.
-///           release)
-///           include: [string] (optional include path hint to find the dependency's include directory, could be the name of the path, or the path itself)
-///         }
-///       }
-///     }
+///   siblings {
+///     name path: string (a sibling conjure project with its own conjure.kdl, built
+///     alongside this one in the same `conjure build`)
 ///   }
 ///
 ///   profiles {
 ///     name: string {
-///       c_flags: (optional: replace | append) [string]
+///       c_flags: [string] (preface with replace to replace the base flags; default appends)
 ///       ld_flags: [string] (same as c_flags)
-///       cc: string (path to the compiler, optional)
-///       linker: string (path to the linker, optional)
 ///     }
 ///   }
 ///
-///   Has the same fields as the dependencies field in sub-projects
-///   dependencies {}
-///
+///   dependencies {
+///     name: string {
+///       (remote | local): string
+///       remote: (codeberg | github | bitbucket | git): string (host + "owner/repo")
+///       local: string (filesystem path to the dependency)
+///       transport: string (ssh | https)
+///       build: string (make | cmake | autotools | meson | ninja | xmake | just | conjure,
+///                      or a free-form command; conjure = build with conjure)
+///       include: [string] (dirs relative to the dep root, each becomes -I<dep>/<dir>)
+///       src: [string] (dir-or-file source roots, for manifestless `build: conjure` deps)
+///       pkg_config: [string] (packages resolved via pkg-config for cflags/libs)
+///       ref: string (branch, tag, or commit to pin; default tracks the default branch)
+///     }
+///   }
 ///   output {
-///     bin: string (optional: set path for binaries)
-///     lib: string (optional: set path for libraries)
-///     symlink_binaries: bool (optional: set whether to symlink binaries to project root)
+///     bin: string (directory for binaries; default "bin")
+///     lib: string (directory for libraries; default "lib")
+///     symlink_binaries: bool (symlink the built binary into the project root for
+///                            convenience when you don't want to use `conjure run`;
+///                            default false)
 ///   }
 /// }
 /// ```
 ///
-#[derive(Deserialize, Serialize, Debug)]
-pub struct ProjectKDL {
-  pub project: Project,
-}
-
+/// The artifact layout under `bin`/`lib` is:
+///   bin/<project>/<profile>/<binary>      e.g. bin/cheese/debug/cheese
+///   lib/<project>/<profile>/lib<project>.{a|so}
+/// where <profile> is the active profile name (default "default"), and <project>
+/// scopes each project's artifacts so co-built siblings don't collide.
+///
 #[derive(Deserialize, Clone, Debug, Serialize)]
 pub struct Project {
   #[serde(deserialize_with = "de_slugify")]
@@ -119,7 +120,7 @@ pub struct Project {
   pub compile: Option<Compile>,
 
   #[serde(default)]
-  pub sub_projects: Option<HashMap<String, SubProject>>,
+  pub siblings: Option<HashMap<String, Sibling>>,
 
   #[serde(default)]
   pub profiles: Option<HashMap<String, Profile>>,
@@ -142,7 +143,7 @@ impl Default for Project {
       authors: None,
       description: None,
       compile: None,
-      sub_projects: None,
+      siblings: None,
       profiles: None,
       dependencies: None,
       output: None,
@@ -201,6 +202,8 @@ pub struct Compile {
   pub linker: Option<String>,
   pub standard: Option<String>,
   pub include: Option<Vec<String>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub src: Option<Vec<String>>,
   #[serde(default)]
   pub c_flags: Option<Flags>,
   #[serde(default)]
@@ -209,18 +212,16 @@ pub struct Compile {
   pub threads: Option<usize>,
 }
 
+impl Compile {
+  pub fn src_roots(&self) -> Vec<String> {
+    self.src.clone().unwrap_or(vec!["src".to_string()])
+  }
+}
+
 #[derive(Deserialize, Clone, Serialize, Debug)]
-pub struct SubProject {
+pub struct Sibling {
   #[serde(rename = "#0")]
   pub path: String,
-  #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-  pub ty: Option<ProjectType>,
-
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub compile: Option<Compile>,
-
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub dependencies: Option<HashMap<String, Dependency>>,
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
@@ -250,6 +251,8 @@ pub struct Dependency {
   pub build: Option<BuildSystem>,
   #[serde(default)]
   pub include: Option<Vec<String>>,
+  #[serde(default)]
+  pub src: Option<Vec<String>>,
   #[serde(default)]
   pub pkg_config: Option<Vec<String>>,
   #[serde(default)]
@@ -317,6 +320,7 @@ impl TryFrom<String> for Transport {
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(try_from = "Vec<String>")]
 pub enum BuildSystem {
+  Conjure(Option<String>),
   Make(Option<String>),
   CMake(Option<String>),
   Autotools(Option<String>),
@@ -330,6 +334,9 @@ pub enum BuildSystem {
 impl std::fmt::Display for BuildSystem {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      BuildSystem::Conjure(_target) => {
+        write!(f, "conjure")
+      }
       BuildSystem::Make(_target) => {
         write!(f, "make")
       }
@@ -362,6 +369,7 @@ impl TryFrom<Vec<String>> for BuildSystem {
   fn try_from(v: Vec<String>) -> Result<Self, Self::Error> {
     let first = v.first().map(|s| s.to_ascii_lowercase());
     match first.as_deref() {
+      Some("conjure") => Ok(Self::Conjure(v.get(1).cloned())),
       Some("make") => Ok(Self::Make(v.get(1).cloned())),
       Some("cmake") => Ok(Self::CMake(v.get(1).cloned())),
       Some("autotools") => Ok(Self::Autotools(v.get(1).cloned())),

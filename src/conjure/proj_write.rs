@@ -106,6 +106,7 @@ impl Serialize for BuildSystem {
   fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
     match self {
       Self::Custom(str) => str.serialize(s),
+      Self::Conjure(t) => with_target("conjure", t, s),
       Self::Make(t) => with_target("make", t, s),
       Self::CMake(t) => with_target("cmake", t, s),
       Self::Autotools(t) => with_target("autotools", t, s),
@@ -163,25 +164,30 @@ pub fn write(path: impl AsRef<Path>, project: Project) -> Result<(), Error> {
     for (name, comment) in [
       (
         "compile",
-        "compiler & linker settings; add `cc`, `c_flags`, `ld_flags`, `standard`",
-      ),
-      (
-        "sub_projects",
-        "nested sub-projects; bare path (subproject has its own conjure.kdl) or map with type/compile/dependencies for non-conjure sub-projects",
+        "compiler & linker settings. `cc` defaults to `cc`; `linker` defaults to\nthe compiler driver, so a bare `cc: clang++` links with clang++ too.\n  standard c11                 // c11 | gnu11 | c17 | c++17 | gnu++20 | ...\n  cc \"ccache gcc\"              // compiler, may carry prefix args\n  linker \"gcc -fuse-ld=mold\"   // linker; gcc/clang/tcc/zig all work\n  src \"src\" \"lib/x\"            // source roots (dirs or files); default [\"src\"]\n  include \"include\" \"third_party\"\n  c_flags -Wall -Wextra        // `replace` prefix overrides base flags\n  ld_flags -flto               // same rules as c_flags\n  threads 8                    // compile/dep parallelism; default = cpu count",
       ),
       (
         "profiles",
-        "build profiles, e.g. debug { c_flags replace \"-g\" \"-O0\"}",
+        "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n  }",
+      ),
+      (
+        "siblings",
+        "co-built sibling conjure projects; each name maps to a directory holding\nits own conjure.kdl, built in the same `conjure build` invocation\n  sibling_name \"libs/sibling_name\"",
       ),
       (
         "dependencies",
-        "dependencies; map with remote/transport/build for remote dependencies; add with conjure add",
+        "external dependencies; manage with `conjure add` / `conjure rm`, pin with\n`conjure lock`/`update`\n  dep_name {\n    remote github \"owner/repo\"  // codeberg | github | bitbucket | git\n    transport ssh               // ssh (default) | https\n    local \"../path/to/dep\"      // instead of remote\n    build cmake libname         // make | cmake | meson | ninja | xmake | autotools | just | conjure, or a raw command\n    include \"include\"\n    pkg_config \"pkg\"\n    ref \"v1.0.0\"\n  }",
       ),
     ] {
       if let Some(n) = children.get_mut(name) {
         n.ensure_children();
         let mut fmt = n.format().cloned().unwrap_or_default();
-        fmt.leading = format!("// {comment}\n");
+        let mut lines = vec![String::new()]; // leading `//` spacer
+        lines.extend(comment.lines().map(|l| format!("// {l}")));
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+          lines.pop();
+        }
+        fmt.leading = lines.join("\n") + "\n";
         n.set_format(fmt);
       }
     }

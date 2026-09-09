@@ -10,6 +10,7 @@ use clap::{
 };
 use kdl::{FormatConfigBuilder, KdlDocument, KdlNode};
 use miette::{IntoDiagnostic, Result};
+use owo_colors::OwoColorize;
 use std::{
   collections::{HashMap, HashSet},
   env, fs,
@@ -268,6 +269,26 @@ fn default_standard(language: Option<Language>) -> &'static str {
   }
 }
 
+fn created_summary(
+  name: &str,
+  language: Option<Language>,
+  standard: Option<String>,
+  ty: Option<TypeType>,
+  link: Option<LinkType>,
+) -> String {
+  format!(
+    "Created project {} with language {}, standard {}, type {}, and link {}",
+    name.bold().green(),
+    language.clone().unwrap_or_default().bold().blue(),
+    standard
+      .unwrap_or_else(|| default_standard(language).to_string())
+      .bold()
+      .yellow(),
+    ty.unwrap_or_default().bold().purple(),
+    link.unwrap_or_default().bold().purple()
+  )
+}
+
 fn build_project(
   name: String,
   language: Option<Language>,
@@ -286,7 +307,7 @@ fn build_project(
       ..Default::default()
     }),
     ty: project_type(ty, link),
-    sub_projects: Some(HashMap::new()),
+    siblings: Some(HashMap::new()),
     profiles: Some(HashMap::from([
       (
         "debug".to_string(),
@@ -512,13 +533,12 @@ fn handle_new(args: &NewArgs) -> Result<()> {
     );
   }
 
-  let format = format!(
-    "Created project `{}` with language `{}`, standard `{}`, type `{}`, and link `{}`",
-    args.name.clone(),
-    args.language.clone().unwrap_or_default(),
-    args.standard.clone().unwrap_or_default(),
-    args.ty.clone().unwrap_or_default(),
-    args.link.clone().unwrap_or_default()
+  let format = created_summary(
+    &args.name,
+    args.language.clone(),
+    args.standard.clone(),
+    args.ty.clone(),
+    args.link.clone(),
   );
 
   proj::make_proj(
@@ -556,13 +576,12 @@ fn handle_init(args: &InitArgs) -> Result<()> {
     );
   }
 
-  let format = format!(
-    "Created project `{}` with language `{}`, standard `{}`, type `{}`, and link `{}`",
-    proj_name,
-    args.language.clone().unwrap_or_default(),
-    args.standard.clone().unwrap_or_default(),
-    args.ty.clone().unwrap_or_default(),
-    args.link.clone().unwrap_or_default()
+  let format = created_summary(
+    &proj_name,
+    args.language.clone(),
+    args.standard.clone(),
+    args.ty.clone(),
+    args.link.clone(),
   );
 
   proj::make_proj(

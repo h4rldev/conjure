@@ -64,10 +64,10 @@ pub fn remote_url(host: &str, path: &str, transport: &str) -> String {
   }
 }
 
-pub fn ensure_cloned(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> {
-  let dir = cache_dir().join(name);
+pub fn ensure_cloned_at(ui: Option<&Ui>, base: &Path, url: &str, name: &str) -> Result<PathBuf> {
+  let dir = base.join(name);
   if !dir.is_dir() {
-    fs::create_dir_all(dir.parent().unwrap()).into_diagnostic()?;
+    fs::create_dir_all(base).into_diagnostic()?;
     let pb = ui.map(|u| u.bar(0, format!("Cloning {name}"), "objects"));
 
     let mut builder = git2::build::RepoBuilder::new();
@@ -82,6 +82,10 @@ pub fn ensure_cloned(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> 
     result.into_diagnostic()?;
   }
   Ok(dir)
+}
+
+pub fn ensure_cloned(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> {
+  ensure_cloned_at(ui, &cache_dir(), url, name)
 }
 
 pub fn clone(ui: Option<&Ui>, url: &str, name: &str) -> Result<PathBuf> {

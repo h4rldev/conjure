@@ -10,4 +10,5 @@ pub(crate) mod lock;
 pub(crate) mod proj;
 pub(crate) mod proj_parse;
 pub(crate) mod proj_write;
+pub(crate) mod toolchain;
 pub(crate) mod ui;

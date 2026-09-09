@@ -6,13 +6,8 @@ project {
   compile {
     standard gnu11
     cc gcc
-    linker "gcc -fuse-ld=mold"
+    linker "gcc -fuse-ld=mold -static"
     ld_flags "-lm"
-  }
-
-  // nested sub-projects; bare path (subproject has its own conjure.kdl) or map with type/compile/dependencies for non-conjure sub-projects
-  sub_projects {
-
   }
 
   // build profiles, e.g. debug { c_flags replace "-g""-O0"}

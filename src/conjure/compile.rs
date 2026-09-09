@@ -1,6 +1,7 @@
 use super::{
   deps::dep_include_dirs,
-  proj_parse::{Flags, Language, Profile, Project},
+  proj_parse::{Flags, Language, Profile, Project, ProjectType},
+  toolchain,
   ui::{StepStatus, Ui, mark},
 };
 use indicatif::ParallelProgressIterator;
@@ -62,7 +63,7 @@ pub fn merged_flags(base: Option<&Flags>, profile: Option<&Flags>) -> Vec<String
 
 pub fn compile_commands(project: &Project, profile: Option<(&str, &Profile)>) -> Result<()> {
   let root = std::env::current_dir().into_diagnostic()?;
-  let entries: Vec<_> = compile_entries(&root, project, profile, vec![])?
+  let entries: Vec<_> = compile_entries(&root, &root, project, profile, vec![])?
     .into_iter()
     .map(|(_, e)| e)
     .collect();
@@ -78,6 +79,7 @@ pub fn compile_commands(project: &Project, profile: Option<(&str, &Profile)>) ->
 
 pub fn compile_entries(
   root: &Path,
+  cache_root: &Path,
   project: &Project,
   profile: Option<(&str, &Profile)>,
   pkg_cflags: Vec<String>,
@@ -94,8 +96,12 @@ pub fn compile_entries(
     Language::Cpp => CPP_SRCS,
   };
 
+  let roots = compile.src_roots();
   let mut sources = vec![];
-  find_sources(Path::new("src"), exts, &mut sources)?;
+  for root_dir in &roots {
+    find_sources(&root.join(root_dir), exts, &mut sources)?;
+  }
+
   miette::ensure!(
     !sources.is_empty(),
     miette::miette!(
@@ -109,36 +115,36 @@ pub fn compile_entries(
     profile_flags.and_then(|p| p.c_flags.as_ref()),
   );
 
-  let obj_dir = PathBuf::from(".conjure")
+  let obj_dir = root
+    .join(".conjure")
     .join("build")
     .join("obj")
     .join(profile_name);
 
   fs::create_dir_all(&obj_dir).into_diagnostic()?;
 
-  let cc = compile
-    .cc
-    .as_deref()
-    .filter(|s| !s.is_empty())
-    .unwrap_or("cc");
+  let tc = toolchain::resolve(compile);
+  // objects feeding a shared library must be compiled PIC
+  let shared_objs = matches!(project.ty, ProjectType::LibraryDynamic);
 
   sources
     .into_iter()
     .map(|src| {
       let rel = src
-        .strip_prefix("src")
+        .strip_prefix(root)
         .unwrap_or(&src)
         .to_string_lossy()
         .replace(['/', '\\'], "_");
-      let obj = obj_dir.join(format!("{rel}.o"));
 
-      let mut arguments = vec![cc.to_string()];
+      let obj = obj_dir.join(&rel).with_extension(tc.obj_ext());
+
+      let mut arguments = tc.cc.clone();
       if let Some(std) = &compile.standard {
-        arguments.push(format!("-std={std}"));
+        arguments.extend(tc.std_args(std));
       }
 
-      for dir in dep_include_dirs(project) {
-        arguments.push(format!("-I{}", dir.display()));
+      for dir in dep_include_dirs(project, root, cache_root) {
+        arguments.push(tc.include_arg(&dir.display().to_string()));
       }
 
       arguments.extend(pkg_cflags.iter().filter(|s| !s.is_empty()).cloned());
@@ -147,17 +153,16 @@ pub fn compile_entries(
           include
             .iter()
             .filter(|s| !s.is_empty())
-            .map(|dir| format!("-I{dir}")),
+            .map(|dir| tc.include_arg(dir)),
         );
       }
 
+      if shared_objs && let Some(pic) = tc.pic_flag() {
+        arguments.push(pic);
+      }
+
       arguments.extend(c_flags.iter().filter(|s| !s.is_empty()).cloned());
-      arguments.extend([
-        "-c".into(),
-        src.display().to_string(),
-        "-o".into(),
-        obj.display().to_string(),
-      ]);
+      arguments.extend(tc.compile_tail(&src.display().to_string(), &obj.display().to_string()));
 
       let entry = CompileEntry {
         directory: root.display().to_string(),
@@ -170,7 +175,7 @@ pub fn compile_entries(
     .collect()
 }
 
-pub fn compile(ui: &Ui, entries: Vec<CompileEntry>, threads: usize) -> Result<()> {
+pub fn compile(ui: &Ui, dir: &Path, entries: Vec<CompileEntry>, threads: usize) -> Result<()> {
   let pb = ui.bar(
     entries.len() as u64,
     format!("Compiling {} sources", entries.len()),
@@ -190,7 +195,7 @@ pub fn compile(ui: &Ui, entries: Vec<CompileEntry>, threads: usize) -> Result<()
       .map(|e| {
         let name = e.file.rsplit('/').next().unwrap_or(&e.file).to_string();
         let file_pb = ui.spinner(format!("Compiling {name}"));
-        let result = ui.exec(Path::new("."), &e.arguments);
+        let result = ui.exec(dir, &e.arguments);
         if result.is_ok() {
           file_pb.finish_and_clear();
         } else {
@@ -199,16 +204,18 @@ pub fn compile(ui: &Ui, entries: Vec<CompileEntry>, threads: usize) -> Result<()
             &format!("Failed to compile {name}"),
           ));
         }
-
         result
       })
       .collect::<Result<()>>()
   });
+
   let status = if result.is_ok() {
     StepStatus::Success
   } else {
     StepStatus::Failure
   };
+
   ui.finish(&pb, &status, &format!("Compiled {} sources", entries.len()));
+
   result
 }
