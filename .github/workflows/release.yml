@@ -1,0 +1,180 @@
+# Build release binaries and attach them to the release on both hosts.
+#
+# Triggered by a `v*` tag, which the Codeberg release workflow pushes and the
+# push-mirror propagates here. Builds Linux (gnu), macOS (x86_64 + arm64), and
+# Windows (both the MSVC and the MinGW/GNU ABIs), then a publish job packages
+# them with checksums, creates the GitHub release, and mirrors the assets onto
+# the matching Codeberg release (creating it as a draft if the bump workflow
+# did not, or if the tag was pushed by hand).
+#
+# Requires a `CODEBERG_TOKEN` secret with write access to the Codeberg repo.
+
+name: Release Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CODEBERG_REPO: h4rl/conjure
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            msys: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            openssl_dir: /usr/local/opt/openssl@3
+          - os: macos-14
+            target: aarch64-apple-darwin
+            openssl_dir: /opt/homebrew/opt/openssl@3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # git2 pulls libgit2 + libssh2 (both vendored by their -sys crates) and
+      # openssl (from the system, hence the per-OS installs below).
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: Install deps (Windows MSVC)
+        if: runner.os == 'Windows' && !matrix.msys
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl libssh2
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "VCPKGRS_DYNAMIC=0" >> $env:GITHUB_ENV
+
+      - uses: msys2/setup-msys2@v2
+        if: matrix.msys
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkgconf
+
+      - name: Build
+        if: ${{ !matrix.msys }}
+        env:
+          OPENSSL_DIR: ${{ matrix.openssl_dir }}
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+
+      - name: Build (MSYS2)
+        if: matrix.msys
+        shell: msys2 {0}
+        env:
+          OPENSSL_DIR: /mingw64
+        run: |
+          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/conjure*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CB_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: raw
+
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p dist
+          for dir in raw/*/; do
+            target="$(basename "$dir")"
+            bin="$(find "$dir" -type f | head -n1)"
+            base="conjure-${version}-${target}"
+            if [[ "$target" == *windows* ]]; then
+              cp "$bin" "dist/${base}.exe"
+              (cd dist && zip -q "${base}.zip" "${base}.exe" && rm "${base}.exe")
+            else
+              cp "$bin" "dist/${base}"
+              tar -czf "dist/${base}.tar.gz" -C dist "${base}"
+              rm "dist/${base}"
+            fi
+          done
+          sha256sum dist/* > dist/SHA256SUMS
+          ls -l dist
+
+      - name: Create or update GitHub release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes dist/*
+          fi
+
+      - name: Mirror assets to the Codeberg release
+        run: |
+          set -euo pipefail
+          api="https://codeberg.org/api/v1/repos/${CODEBERG_REPO}/releases"
+
+          # Find the release by tag. The list endpoint is used rather than
+          # /tags/ so a draft release (default from the bump workflow) is found.
+          find_id() {
+            curl -fsS -H "Authorization: token ${CB_TOKEN}" "${api}?limit=100" \
+              | jq -r --arg t "$TAG" '.[] | select(.tag_name == $t) | .id' \
+              | head -n1
+          }
+
+          rid="$(find_id || true)"
+          if [ -z "$rid" ] || [ "$rid" = "null" ]; then
+            body="$(gh release view "$TAG" --json body -q .body)"
+            jq -n --arg t "$TAG" --arg b "$body" \
+              '{tag_name: $t, name: $t, body: $b, draft: true, prerelease: false}' \
+              | curl -fsS -X POST \
+                  -H "Authorization: token ${CB_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d @- "${api}"
+            rid="$(find_id)"
+          fi
+
+          for f in dist/*; do
+            name="$(basename "$f")"
+            curl -fsS -X POST \
+              -H "Authorization: token ${CB_TOKEN}" \
+              -F "attachment=@$f" \
+              "${api}/${rid}/assets?name=${name}"
+          done

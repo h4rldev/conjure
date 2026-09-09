@@ -1,12 +1,13 @@
 project {
   name example
   language c
-  type binary dynamic
+  type binary
+  link dynamic
   // compiler & linker settings; add `cc`, `c_flags`, `ld_flags`, `standard`
   compile {
     standard gnu11
     cc gcc
-    linker "gcc -fuse-ld=mold -static"
+    linker "mold"
     ld_flags "-lm"
   }
 
@@ -29,6 +30,27 @@ project {
       build cmake libh2o
       pkg_config "libuv" "zlib" "openssl"
       include "include" "deps/picotls/include" "deps/quicly/include"
+    }
+
+    zlib {
+      remote github "madler/zlib"
+      transport ssh
+      build cmake zlib
+      include include
+    }
+
+    json-c {
+      remote github "json-c/json-c"
+      transport ssh
+      build cmake json-c
+      include include
+    }
+
+    cjson {
+      remote github "DaveGamble/cJSON"
+      transport ssh
+      build cmake cjson
+      include .
     }
   }
 }

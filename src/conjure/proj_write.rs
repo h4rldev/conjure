@@ -1,10 +1,48 @@
+//! Writing `conjure.kdl`: serialization of a [`Project`] plus the KDL formatting
+//! fixups this project needs.
+//!
+//! `kdl`'s serializer drops value quoting and can mis-place the `project` node's
+//! braces, so generated manifests are passed through [`fix_braces`] (balanced
+//! brace indentation, blank lines between top-level sections). The `Serialize`
+//! impls here exist because the covered enums must render as bare KDL tokens
+//! (`type binary`, `link static`, `remote github "o/r"`) rather than serde's
+//! default shapes; they mirror the declaration order in `proj_parse`.
+//!
+//! Every `conjure new`/`init` manifest is written through here, and `conjure
+//! add`/`rm` round-trip their edits through it.
+
+/***********************************************************************/
+
 use super::proj_parse::{
-  BuildSystem, Flags, Language, Project, ProjectKDL, ProjectType, Remote, Transport,
+  Arch, BuildSystem, Flags, Language, Linkage, Project, ProjectKDL,
+  ProjectType, Remote, Transport,
 };
 use miette::Result;
 use serde::Serialize;
 use std::{fs, path::Path};
 
+/***********************************************************************/
+
+const SECTION_COMMENTS: &[(&str, &str)] = &[
+  (
+    "compile",
+    "compiler & linker settings. `cc` defaults to `cc`; `linker` defaults to\nthe compiler driver, so a bare `cc: clang++` links with clang++ too.\n  standard c11                 // c11 | gnu11 | c17 | c++17 | gnu++20 | ...\n  cc \"ccache gcc\"              // compiler, may carry prefix args\n  linker \"gcc -fuse-ld=mold\"   // linker; gcc/clang/tcc/zig all work\n  src \"src\" \"lib/x\"            // source roots (dirs or files); default [\"src\"]\n  include \"include\" \"third_party\"\n  c_flags -Wall -Wextra        // `replace` prefix overrides base flags\n  ld_flags -flto               // same rules as c_flags\n  threads 8                    // compile/dep parallelism; default = cpu count",
+  ),
+  (
+    "profiles",
+    "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n  }",
+  ),
+  (
+    "siblings",
+    "co-built sibling conjure projects; each name maps to a directory holding\nits own conjure.kdl, built in the same `conjure build` invocation\n  sibling_name \"libs/sibling_name\"",
+  ),
+  (
+    "dependencies",
+    "external dependencies; manage with `conjure add` / `conjure rm`, pin with\n`conjure lock`/`update`\n  dep_name {\n    remote github \"owner/repo\"  // codeberg | github | bitbucket | git\n    transport ssh               // ssh (default) | https\n    local \"../path/to/dep\"      // instead of remote\n    build cmake libname         // make | cmake | meson | ninja | xmake | autotools | just | conjure, or a raw command\n    include \"include\"\n    pkg_config \"pkg\"\n    ref \"v1.0.0\"\n  }",
+  ),
+];
+
+/// Errors from serializing or writing a project file.
 #[derive(Debug, miette::Diagnostic)]
 pub enum Error {
   #[diagnostic_source]
@@ -15,8 +53,8 @@ pub enum Error {
 impl std::fmt::Display for Error {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::Io(e) => write!(f, "failed to write project file: {e}"),
-      Self::Se(e) => write!(f, "failed to serialize project file: {e}"),
+      Self::Io(e) => write!(f, "Failed to write project file: {e}"),
+      Self::Se(e) => write!(f, "Failed to serialize project file: {e}"),
     }
   }
 }
@@ -42,27 +80,49 @@ impl From<kdl::se::Error> for Error {
   }
 }
 
-impl Serialize for ProjectType {
+impl Serialize for Language {
   fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-    let (kind, linkage) = match self {
-      Self::BinaryDynamic => ("binary", "dynamic"),
-      Self::BinaryStatic => ("binary", "static"),
-      Self::LibraryDynamic => ("library", "dynamic"),
-      Self::LibraryStatic => ("library", "static"),
-    };
-    (kind, linkage).serialize(s)
+    match self {
+      Self::C => "c".serialize(s),
+      Self::Cpp => "c++".serialize(s),
+    }
   }
 }
 
-impl Serialize for Flags {
+impl Serialize for ProjectType {
   fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
     match self {
-      Self::Append(v) => v.serialize(s),
-      Self::Replace(v) => {
-        let mut out = vec!["replace".to_string()];
-        out.extend(v.iter().cloned());
-        out.serialize(s)
-      }
+      Self::Binary => "binary".serialize(s),
+      Self::Library => "library".serialize(s),
+    }
+  }
+}
+
+impl Serialize for Linkage {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    match self {
+      Self::Dynamic => "dynamic".serialize(s),
+      Self::Static => "static".serialize(s),
+    }
+  }
+}
+
+impl Serialize for Arch {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    match self {
+      Self::Native => "native".serialize(s),
+      Self::X86 => "x86".serialize(s),
+      Self::X86_64 => "x64".serialize(s),
+      Self::Arm64 => "arm64".serialize(s),
+    }
+  }
+}
+
+impl Serialize for Transport {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    match self {
+      Self::Ssh => "ssh".serialize(s),
+      Self::Https => "https".serialize(s),
     }
   }
 }
@@ -80,15 +140,8 @@ impl Serialize for Remote {
   }
 }
 
-impl Serialize for Transport {
-  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-    match self {
-      Self::Ssh => "ssh".serialize(s),
-      Self::Https => "https".serialize(s),
-    }
-  }
-}
-
+/// Render a build system as `system [target]` tokens; the only consumer is
+/// [`BuildSystem`]'s `Serialize`.
 fn with_target<S: serde::Serializer>(
   system: &str,
   target: &Option<String>,
@@ -118,21 +171,37 @@ impl Serialize for BuildSystem {
   }
 }
 
-impl Serialize for Language {
+impl Serialize for Flags {
   fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
     match self {
-      Self::C => "c".serialize(s),
-      Self::Cpp => "c++".serialize(s),
+      Self::Append(v) => v.serialize(s),
+      Self::Replace(v) => {
+        let mut out = vec!["replace".to_string()];
+        out.extend(v.iter().cloned());
+        out.serialize(s)
+      }
     }
   }
 }
 
+/// Re-indent KDL by tracking brace depth, and insert a blank line between
+/// top-level sections.
+///
+/// Comment lines are emitted verbatim and never counted as braces: the template
+/// comments contain brace examples (`//   profile_name {`), and treating those
+/// as real blocks would desync the stack and mis-indent the file's final `}`.
 pub fn fix_braces(s: &str) -> String {
   let lines: Vec<&str> = s.lines().collect();
   let mut out = String::new();
   let mut stack: Vec<String> = vec![];
 
   for (i, line) in lines.iter().enumerate() {
+    if line.trim_start().starts_with("//") {
+      out.push_str(line);
+      out.push('\n');
+      continue;
+    }
+
     if line.trim() == "}" {
       let indent = stack.pop().unwrap_or_default();
       out.push_str(&indent);
@@ -155,30 +224,15 @@ pub fn fix_braces(s: &str) -> String {
   out
 }
 
+/// Serialize `project` to `path`, annotating its nodes with the example comments
+/// from [`SECTION_COMMENTS`].
 pub fn write(path: impl AsRef<Path>, project: Project) -> Result<(), Error> {
   let mut doc = kdl::se::to_document(&ProjectKDL { project })?;
   if let Some(children) = doc
     .get_mut("project")
     .and_then(|n| n.children_mut().as_mut())
   {
-    for (name, comment) in [
-      (
-        "compile",
-        "compiler & linker settings. `cc` defaults to `cc`; `linker` defaults to\nthe compiler driver, so a bare `cc: clang++` links with clang++ too.\n  standard c11                 // c11 | gnu11 | c17 | c++17 | gnu++20 | ...\n  cc \"ccache gcc\"              // compiler, may carry prefix args\n  linker \"gcc -fuse-ld=mold\"   // linker; gcc/clang/tcc/zig all work\n  src \"src\" \"lib/x\"            // source roots (dirs or files); default [\"src\"]\n  include \"include\" \"third_party\"\n  c_flags -Wall -Wextra        // `replace` prefix overrides base flags\n  ld_flags -flto               // same rules as c_flags\n  threads 8                    // compile/dep parallelism; default = cpu count",
-      ),
-      (
-        "profiles",
-        "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n  }",
-      ),
-      (
-        "siblings",
-        "co-built sibling conjure projects; each name maps to a directory holding\nits own conjure.kdl, built in the same `conjure build` invocation\n  sibling_name \"libs/sibling_name\"",
-      ),
-      (
-        "dependencies",
-        "external dependencies; manage with `conjure add` / `conjure rm`, pin with\n`conjure lock`/`update`\n  dep_name {\n    remote github \"owner/repo\"  // codeberg | github | bitbucket | git\n    transport ssh               // ssh (default) | https\n    local \"../path/to/dep\"      // instead of remote\n    build cmake libname         // make | cmake | meson | ninja | xmake | autotools | just | conjure, or a raw command\n    include \"include\"\n    pkg_config \"pkg\"\n    ref \"v1.0.0\"\n  }",
-      ),
-    ] {
+    for (name, comment) in SECTION_COMMENTS {
       if let Some(n) = children.get_mut(name) {
         n.ensure_children();
         let mut fmt = n.format().cloned().unwrap_or_default();
@@ -198,4 +252,38 @@ pub fn write(path: impl AsRef<Path>, project: Project) -> Result<(), Error> {
 
   fs::write(path, fix_braces(&doc.to_string()))?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn fix_braces_ignores_comment_braces() {
+    let input = "project {\n  // example {\n  //   inner {\n  // }\n  compile {\n    a b\n  }\n}\n";
+    let out = fix_braces(input);
+    assert_eq!(out.lines().last(), Some("}"));
+    assert!(out.contains("// example {"));
+  }
+
+  #[test]
+  fn fix_braces_nests_blocks() {
+    let input = "project {\n    compile {\n        x y\n    }\n}\n";
+    let out = fix_braces(input);
+    assert_eq!(out, "project {\n    compile {\n        x y\n    }\n}\n");
+  }
+
+  #[test]
+  fn serialize_enum_tokens() {
+    let project: Project = kdl::de::from_str::<ProjectKDL>(
+      "project {\n  name s\n  language c\n  type library\n  link static\n}\n",
+    )
+    .unwrap()
+    .project;
+    let doc = kdl::se::to_document(&ProjectKDL { project })
+      .unwrap()
+      .to_string();
+    assert!(doc.contains("type library"));
+    assert!(doc.contains("link static"));
+  }
 }

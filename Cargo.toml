@@ -2,14 +2,28 @@
 name = "conjure"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "A modern build tool and dependency manager for C and C++."
+license = "BSD-3-Clause"
+repository = "https://codeberg.org/h4rl/conjure"
+readme = "README.md"
+authors = ["h4rl"]
+keywords = ["build", "cpp", "c", "build-system", "dependency-manager"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
+exclude = [".forgejo", ".github", "example", "example2", "flake.nix", "flake.lock", ".direnv", ".envrc"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
-indicatif = { version = "0.18.6", features = ["improved_unicode", "rayon"] }
-kdl = { version =  "6.7.1", features = ["serde"] }
-miette = { version = "7.6.0", features = ["fancy"] }
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width", "rayon"] }
+kdl = { version = "6.7.1", default-features = false, features = ["serde"] }
+miette = { version = "7.6.0", default-features = false, features = ["derive", "fancy-no-backtrace"] }
 owo-colors = "4.3.0"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

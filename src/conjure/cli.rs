@@ -1,6 +1,19 @@
+//! Command-line interface: argument parsing and the `handle_*` implementations
+//! for every subcommand.
+//!
+//! The clap types at the top are the sole source of the CLI surface; each
+//! subcommand's `handle_*` below does the work. Most subcommands operate on the
+//! manifest in the current directory (`.conjure.kdl`), while `conjure add`/`rm`
+//! edit it in place through `proj_write`'s helpers and `conjure as` re-enters the
+//! CLI under an active profile.
+
+/***********************************************************************/
+
 use super::{
   build, compile, git, lock, proj,
-  proj_parse::{self, Compile, Flags, Profile, Project, ProjectType, slugify},
+  proj_parse::{
+    self, Arch, Compile, Flags, Linkage, Profile, Project, ProjectType, slugify,
+  },
   proj_write::fix_braces,
   ui::{StepStatus, Ui},
 };
@@ -17,6 +30,8 @@ use std::{
   path::Path,
 };
 
+/***********************************************************************/
+
 const LONG_ABOUT: &str = r#"
 Conjure, the modern build-tool for C and C++.
 Made by h4rl, for everyone.
@@ -24,45 +39,122 @@ Made by h4rl, for everyone.
 
 const HELP_TEMPLATE: &str = "{about}\n{usage-heading} {usage}\n\n{all-args}";
 
-fn styles() -> Styles {
-  Styles::styled()
-    .header(AnsiColor::Green.on_default().bold())
-    .usage(AnsiColor::Green.on_default().bold())
-    .literal(AnsiColor::BrightBlue.on_default())
-    .placeholder(AnsiColor::BrightCyan.on_default())
+#[derive(Clone, ValueEnum, Default)]
+enum Language {
+  #[value(alias = "c")]
+  #[default]
+  C,
+  #[value(alias = "c++")]
+  Cpp,
 }
 
-#[derive(Parser)]
-#[command(version, about, long_about = Some(LONG_ABOUT), help_template = HELP_TEMPLATE)]
-#[command(propagate_version = true)]
-#[command(styles = styles())]
-struct Cli {
-  #[command(subcommand)]
-  command: Commands,
+impl std::fmt::Display for Language {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Language::C => write!(f, "C"),
+      Language::Cpp => write!(f, "C++"),
+    }
+  }
 }
 
-#[derive(Subcommand)]
-enum Commands {
-  /// Create a new conjure project
-  New(NewArgs),
-  /// Initialize a conjure project in the current directory
-  Init(InitArgs),
-  /// Add a dependency to the project
-  Add(AddArgs),
-  /// Remove a dependency from the project
-  #[command(alias = "remove")]
-  Rm(RemoveArgs),
-  /// Lock the project's dependencies
-  Lock,
-  /// Update the project's dependencies, and recache them.
-  Update(UpdateArgs),
-  /// Build the project
-  Build(BuildArgs),
-  /// Generate a compile_commands.json for clangd
-  #[command(name = "compile-commands")]
-  Compile(CompileCommandsArgs),
-  /// Run a subcommand as a specific profile
-  As(AsArgs),
+#[derive(Clone, ValueEnum, Default)]
+enum TypeType {
+  #[value(alias = "binary")]
+  #[default]
+  Binary,
+  #[value(alias = "library")]
+  Library,
+}
+
+impl std::fmt::Display for TypeType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      TypeType::Binary => write!(f, "binary"),
+      TypeType::Library => write!(f, "library"),
+    }
+  }
+}
+
+#[derive(Clone, ValueEnum, Default)]
+enum LinkType {
+  #[value(alias = "static")]
+  Static,
+  #[value(alias = "dynamic")]
+  #[default]
+  Dynamic,
+}
+
+impl std::fmt::Display for LinkType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      LinkType::Static => write!(f, "static"),
+      LinkType::Dynamic => write!(f, "dynamic"),
+    }
+  }
+}
+
+#[derive(Clone, ValueEnum, Default)]
+enum ArchType {
+  #[value(alias = "native")]
+  #[default]
+  Native,
+  #[value(alias = "x86")]
+  X86,
+  #[value(alias = "x64")]
+  X64,
+  #[value(alias = "arm64")]
+  Arm64,
+}
+
+impl std::fmt::Display for ArchType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      ArchType::Native => write!(f, "native"),
+      ArchType::X86 => write!(f, "x86"),
+      ArchType::X64 => write!(f, "x64"),
+      ArchType::Arm64 => write!(f, "arm64"),
+    }
+  }
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+enum Transport {
+  #[value(alias = "ssh")]
+  Ssh,
+  #[value(alias = "https")]
+  Https,
+}
+
+#[derive(Clone, ValueEnum)]
+enum BuildSystem {
+  #[value(alias = "make")]
+  Make,
+  #[value(alias = "cmake")]
+  Cmake,
+  #[value(alias = "autotools")]
+  Autotools,
+  #[value(alias = "meson")]
+  Meson,
+  #[value(alias = "ninja")]
+  Ninja,
+  #[value(alias = "xmake")]
+  Xmake,
+  #[value(alias = "just")]
+  Just,
+}
+
+#[derive(Clone, ValueEnum)]
+enum LocalOrRemote {
+  #[value(alias = "local")]
+  Local,
+  #[value(alias = "codeberg")]
+  Codeberg,
+  #[value(alias = "github")]
+  Github,
+  #[value(alias = "bitbucket")]
+  Bitbucket,
+  #[value(alias = "git")]
+  Git,
 }
 
 #[derive(Args)]
@@ -84,6 +176,9 @@ struct NewArgs {
   /// Force the creation of the project
   #[arg(long)]
   force: bool,
+  /// Target architecture
+  #[arg(long, short = 'a', value_enum)]
+  arch: Option<ArchType>,
 }
 
 #[derive(Args)]
@@ -106,6 +201,9 @@ struct InitArgs {
   /// Force the creation of the project
   #[arg(long)]
   force: bool,
+  /// Target architecture
+  #[arg(long, short = 'a', value_enum)]
+  arch: Option<ArchType>,
 }
 
 #[derive(Args)]
@@ -141,8 +239,12 @@ struct UpdateArgs {
 
 #[derive(Args)]
 struct BuildArgs {
+  /// Build profile to use
   #[arg(long, short = 'p')]
   profile: Option<String>,
+  /// Force a build even if nothing has changed
+  #[arg(long, short = 'f')]
+  force: bool,
 }
 
 #[derive(Args)]
@@ -158,107 +260,69 @@ struct AsArgs {
   subcommand: Vec<String>,
 }
 
-#[derive(Clone, ValueEnum, Debug)]
-enum Transport {
-  #[value(alias = "ssh")]
-  Ssh,
-  #[value(alias = "https")]
-  Https,
+#[derive(Subcommand)]
+enum Commands {
+  /// Create a new Conjure project
+  New(NewArgs),
+  /// Initialize a Conjure project in the current directory
+  Init(InitArgs),
+  /// Add a dependency to the project
+  Add(AddArgs),
+  /// Remove a dependency from the project
+  #[command(alias = "remove")]
+  Rm(RemoveArgs),
+  /// Lock the project's dependencies
+  Lock,
+  /// Update the project's dependencies, and recache them.
+  Update(UpdateArgs),
+  /// Build the project
+  Build(BuildArgs),
+  /// Generate a compile_commands.json for clangd
+  #[command(name = "compile-commands")]
+  Compile(CompileCommandsArgs),
+  /// Run a subcommand as a specific profile
+  As(AsArgs),
 }
 
-#[derive(Clone, ValueEnum)]
-enum BuildSystem {
-  #[value(alias = "make")]
-  Make,
-  #[value(alias = "cmake")]
-  Cmake,
-  #[value(alias = "autotools")]
-  Autotools,
-  #[value(alias = "meson")]
-  Meson,
-  #[value(alias = "ninja")]
-  Ninja,
-  #[value(alias = "xmake")]
-  Xmake,
+fn styles() -> Styles {
+  Styles::styled()
+    .header(AnsiColor::Green.on_default().bold())
+    .usage(AnsiColor::Green.on_default().bold())
+    .literal(AnsiColor::BrightBlue.on_default())
+    .placeholder(AnsiColor::BrightCyan.on_default())
 }
 
-#[derive(Clone, ValueEnum)]
-enum LocalOrRemote {
-  #[value(alias = "local")]
-  Local,
-  #[value(alias = "codeberg")]
-  Codeberg,
-  #[value(alias = "github")]
-  Github,
-  #[value(alias = "bitbucket")]
-  Bitbucket,
-  #[value(alias = "git")]
-  Git,
+#[derive(Parser)]
+#[command(version, about, long_about = Some(LONG_ABOUT), help_template = HELP_TEMPLATE)]
+#[command(propagate_version = true)]
+#[command(styles = styles())]
+struct Cli {
+  #[command(subcommand)]
+  command: Commands,
 }
 
-#[derive(Clone, ValueEnum, Default)]
-enum Language {
-  #[value(alias = "c")]
-  #[default]
-  C,
-  #[value(alias = "c++")]
-  Cpp,
-}
-
-#[derive(Clone, ValueEnum, Default)]
-enum TypeType {
-  #[value(alias = "binary")]
-  #[default]
-  Binary,
-  #[value(alias = "library")]
-  Library,
-}
-
-#[derive(Clone, ValueEnum, Default)]
-enum LinkType {
-  #[value(alias = "static")]
-  Static,
-  #[value(alias = "dynamic")]
-  #[default]
-  Dynamic,
-}
-
-impl std::fmt::Display for Language {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Language::C => write!(f, "C"),
-      Language::Cpp => write!(f, "C++"),
-    }
+fn project_arch(arch: ArchType) -> Arch {
+  match arch {
+    ArchType::X86 => Arch::X86,
+    ArchType::X64 => Arch::X86_64,
+    ArchType::Arm64 => Arch::Arm64,
+    ArchType::Native => Arch::Native,
   }
 }
 
-impl std::fmt::Display for TypeType {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      TypeType::Binary => write!(f, "binary"),
-      TypeType::Library => write!(f, "library"),
-    }
+fn project_type(ty: Option<TypeType>) -> ProjectType {
+  match ty {
+    Some(TypeType::Binary) => ProjectType::Binary,
+    Some(TypeType::Library) => ProjectType::Library,
+    None => ProjectType::default(),
   }
 }
 
-impl std::fmt::Display for LinkType {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      LinkType::Static => write!(f, "static"),
-      LinkType::Dynamic => write!(f, "dynamic"),
-    }
-  }
-}
-
-fn project_type(ty: Option<TypeType>, link: Option<LinkType>) -> ProjectType {
-  match (
-    ty.unwrap_or(TypeType::Binary),
-    link.unwrap_or(LinkType::Dynamic),
-  ) {
-    (TypeType::Binary, LinkType::Static) => ProjectType::BinaryStatic,
-    (TypeType::Binary, LinkType::Dynamic) => ProjectType::BinaryDynamic,
-    (TypeType::Library, LinkType::Static) => ProjectType::LibraryStatic,
-    (TypeType::Library, LinkType::Dynamic) => ProjectType::LibraryDynamic,
+fn project_link(link: Option<LinkType>) -> Linkage {
+  match link {
+    Some(LinkType::Static) => Linkage::Static,
+    Some(LinkType::Dynamic) => Linkage::Dynamic,
+    None => Linkage::default(),
   }
 }
 
@@ -269,15 +333,18 @@ fn default_standard(language: Option<Language>) -> &'static str {
   }
 }
 
+/// The one-line success message shared by `new` and `init`, showing the values
+/// the project was actually created with (defaults filled in).
 fn created_summary(
   name: &str,
   language: Option<Language>,
   standard: Option<String>,
   ty: Option<TypeType>,
   link: Option<LinkType>,
+  arch: Option<ArchType>,
 ) -> String {
   format!(
-    "Created project {} with language {}, standard {}, type {}, and link {}",
+    "Created project {} with language {}, standard {}, type {}, link {}, and arch {}",
     name.bold().green(),
     language.clone().unwrap_or_default().bold().blue(),
     standard
@@ -285,16 +352,20 @@ fn created_summary(
       .bold()
       .yellow(),
     ty.unwrap_or_default().bold().purple(),
-    link.unwrap_or_default().bold().purple()
+    link.unwrap_or_default().bold().purple(),
+    arch.unwrap_or_default().bold().cyan()
   )
 }
 
+/// Assemble the manifest for a freshly created project, including the default
+/// `debug`/`release` profiles.
 fn build_project(
   name: String,
   language: Option<Language>,
   standard: Option<String>,
   ty: Option<TypeType>,
   link: Option<LinkType>,
+  arch: Option<ArchType>,
 ) -> Project {
   Project {
     name,
@@ -303,24 +374,39 @@ fn build_project(
       _ => crate::conjure::proj_parse::Language::C,
     },
     compile: Some(Compile {
-      standard: Some(standard.unwrap_or_else(|| default_standard(language).to_string())),
+      standard: Some(
+        standard.unwrap_or_else(|| default_standard(language).to_string()),
+      ),
+      arch: arch.map(project_arch),
       ..Default::default()
     }),
-    ty: project_type(ty, link),
+    ty: project_type(ty),
+    link: project_link(link),
     siblings: Some(HashMap::new()),
     profiles: Some(HashMap::from([
       (
         "debug".to_string(),
         Profile {
-          c_flags: Some(Flags::Append(vec!["-g".to_string(), "-O0".to_string()])),
-          ld_flags: Some(Flags::Append(vec!["-g".to_string(), "-O0".to_string()])),
+          c_flags: Some(Flags::Append(vec![
+            "-g".to_string(),
+            "-O0".to_string(),
+          ])),
+          ld_flags: Some(Flags::Append(vec![
+            "-g".to_string(),
+            "-O0".to_string(),
+          ])),
+          ..Default::default()
         },
       ),
       (
         "release".to_string(),
         Profile {
           c_flags: Some(Flags::Append(vec!["-O2".to_string()])),
-          ld_flags: Some(Flags::Append(vec!["-O2".to_string(), "-flto".to_string()])),
+          ld_flags: Some(Flags::Append(vec![
+            "-O2".to_string(),
+            "-flto".to_string(),
+          ])),
+          ..Default::default()
         },
       ),
     ])),
@@ -329,6 +415,7 @@ fn build_project(
   }
 }
 
+/// Best-effort build-system detection for an added dependency, by marker file.
 fn guess_build_system(dir: &Path) -> Option<BuildSystem> {
   for (marker, system) in [
     ("CMakeLists.txt", BuildSystem::Cmake),
@@ -337,6 +424,8 @@ fn guess_build_system(dir: &Path) -> Option<BuildSystem> {
     ("configure", BuildSystem::Autotools),
     ("GNUmakefile", BuildSystem::Make),
     ("makefile", BuildSystem::Make),
+    ("justfile", BuildSystem::Just),
+    ("Justfile", BuildSystem::Just),
     ("Makefile", BuildSystem::Make),
     ("xmake.lua", BuildSystem::Xmake),
     ("build.ninja", BuildSystem::Ninja),
@@ -348,6 +437,11 @@ fn guess_build_system(dir: &Path) -> Option<BuildSystem> {
   None
 }
 
+/// Re-apply the quoting KDL parsing discarded.
+///
+/// `kdl` does not preserve value quoting, so a rewritten manifest would turn a
+/// deliberately-quoted `"c"` into bare `c`. `original` is the pre-edit text;
+/// every word that was quoted there is re-quoted in `out`.
 fn restore_quotes(original: &str, out: &str) -> String {
   let quoted: HashSet<&str> = original.split('"').skip(1).step_by(2).collect();
   if quoted.is_empty() {
@@ -387,6 +481,7 @@ fn restore_quotes(original: &str, out: &str) -> String {
   res
 }
 
+/// Autoformat an edited `conjure.kdl`, restore its quoting, and write it back.
 fn save_edit(text: &str, doc: &mut kdl::KdlDocument) -> Result<()> {
   let cfg = FormatConfigBuilder::new().indent("  ").build();
   doc.autoformat_config(&cfg);
@@ -395,6 +490,21 @@ fn save_edit(text: &str, doc: &mut kdl::KdlDocument) -> Result<()> {
   Ok(())
 }
 
+fn dependency_exists(name: &str) -> Result<bool> {
+  let text = std::fs::read_to_string("conjure.kdl").into_diagnostic()?;
+  let doc: KdlDocument = text.parse().into_diagnostic()?;
+  Ok(
+    doc
+      .get("project")
+      .and_then(|p| p.children())
+      .and_then(|c| c.get("dependencies"))
+      .and_then(|d| d.children())
+      .is_some_and(|deps| deps.get(name).is_some()),
+  )
+}
+
+/// Insert or replace a dependency node in `conjure.kdl`, building the node from
+/// the CLI args and round-tripping the file through [`save_edit`].
 fn edit_dependencies(
   args: &AddArgs,
   name: &str,
@@ -440,7 +550,9 @@ fn edit_dependencies(
 
   let mut frag = format!("{name} {{");
   match &args.local_or_remote {
-    LocalOrRemote::Local => frag.push_str(&format!("\n  local \"{}\"", args.path_or_url)),
+    LocalOrRemote::Local => {
+      frag.push_str(&format!("\n  local \"{}\"", args.path_or_url))
+    }
     host => frag.push_str(&format!(
       "\n  remote {} \"{}\"",
       host.to_possible_value().unwrap().get_name(),
@@ -468,6 +580,8 @@ fn edit_dependencies(
   Ok(())
 }
 
+/// Clone (or reuse) a remote dependency and record its resolved commit in the
+/// lockfile. `fetch` selects `conjure update`'s always-refetch behavior.
 fn lock_remote(
   ui: &Ui,
   lock: &mut lock::LockFile,
@@ -512,6 +626,8 @@ fn lock_remote(
   Ok(())
 }
 
+/// Whether the current manifest declares any profiles (used to hide the `as`
+/// subcommand when it would be useless).
 fn has_profiles() -> bool {
   Project::from_file("conjure.kdl")
     .ok()
@@ -539,6 +655,7 @@ fn handle_new(args: &NewArgs) -> Result<()> {
     args.standard.clone(),
     args.ty.clone(),
     args.link.clone(),
+    args.arch.clone(),
   );
 
   proj::make_proj(
@@ -549,6 +666,7 @@ fn handle_new(args: &NewArgs) -> Result<()> {
       args.standard.clone(),
       args.ty.clone(),
       args.link.clone(),
+      args.arch.clone(),
     ),
   )?;
 
@@ -582,6 +700,7 @@ fn handle_init(args: &InitArgs) -> Result<()> {
     args.standard.clone(),
     args.ty.clone(),
     args.link.clone(),
+    args.arch.clone(),
   );
 
   proj::make_proj(
@@ -592,24 +711,12 @@ fn handle_init(args: &InitArgs) -> Result<()> {
       args.standard.clone(),
       args.ty.clone(),
       args.link.clone(),
+      args.arch.clone(),
     ),
   )?;
 
   ui.println(Some(&StepStatus::Success), format)?;
   Ok(())
-}
-
-fn dependency_exists(name: &str) -> Result<bool> {
-  let text = std::fs::read_to_string("conjure.kdl").into_diagnostic()?;
-  let doc: KdlDocument = text.parse().into_diagnostic()?;
-  Ok(
-    doc
-      .get("project")
-      .and_then(|p| p.children())
-      .and_then(|c| c.get("dependencies"))
-      .and_then(|d| d.children())
-      .is_some_and(|deps| deps.get(name).is_some()),
-  )
 }
 
 fn handle_add(args: &AddArgs) -> Result<()> {
@@ -641,13 +748,15 @@ fn handle_add(args: &AddArgs) -> Result<()> {
         .unwrap()
         .get_name()
         .to_string();
-      let dir = git::clone_remote(Some(&ui), host_name, &args.path_or_url, &t, &name)?;
+      let dir =
+        git::clone_remote(Some(&ui), host_name, &args.path_or_url, &t, &name)?;
       let build = args
         .build
         .as_ref()
         .map(|b| b.to_possible_value().unwrap().get_name().to_string())
         .or_else(|| {
-          guess_build_system(&dir).map(|b| b.to_possible_value().unwrap().get_name().to_string())
+          guess_build_system(&dir)
+            .map(|b| b.to_possible_value().unwrap().get_name().to_string())
         });
       (Some(dir), build, Some(t))
     }
@@ -662,15 +771,23 @@ fn handle_add(args: &AddArgs) -> Result<()> {
     let commit = git::resolve_head(&dir)?;
     let r#ref = git::head_ref(&dir)?.or_else(|| args.r#ref.clone());
     let remote = Some(match &args.local_or_remote {
-      LocalOrRemote::Codeberg => proj_parse::Remote::Codeberg(args.path_or_url.clone()),
-      LocalOrRemote::Github => proj_parse::Remote::GitHub(args.path_or_url.clone()),
-      LocalOrRemote::Bitbucket => proj_parse::Remote::BitBucket(args.path_or_url.clone()),
+      LocalOrRemote::Codeberg => {
+        proj_parse::Remote::Codeberg(args.path_or_url.clone())
+      }
+      LocalOrRemote::Github => {
+        proj_parse::Remote::GitHub(args.path_or_url.clone())
+      }
+      LocalOrRemote::Bitbucket => {
+        proj_parse::Remote::BitBucket(args.path_or_url.clone())
+      }
       LocalOrRemote::Git => proj_parse::Remote::Git(args.path_or_url.clone()),
       LocalOrRemote::Local => unreachable!(),
     });
 
     let transport = transport_name
-      .map(|s| proj_parse::Transport::try_from(s).map_err(|e| miette::miette!(e)))
+      .map(|s| {
+        proj_parse::Transport::try_from(s).map_err(|e| miette::miette!(e))
+      })
       .transpose()?;
 
     let mut lock = lock::LockFile::load("conjure.lock")?;
@@ -705,14 +822,13 @@ fn handle_remove(args: &RemoveArgs) -> Result<()> {
       "No children in project node, is your project malformed?"
     ))?;
 
-  let deps = project_children
-    .get_mut("dependencies")
-    .ok_or_else(|| miette::miette!("No dependency node in project, nothing to remove"))?;
+  let deps = project_children.get_mut("dependencies").ok_or_else(|| {
+    miette::miette!("No dependency node in project, nothing to remove")
+  })?;
 
-  let deps_children = deps
-    .children_mut()
-    .as_mut()
-    .ok_or_else(|| miette::miette!("No children in dependencies node, nothing to remove"))?;
+  let deps_children = deps.children_mut().as_mut().ok_or_else(|| {
+    miette::miette!("No children in dependencies node, nothing to remove")
+  })?;
 
   miette::ensure!(
     deps_children.get(&args.name).is_some(),
@@ -810,7 +926,9 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
       .dependencies
       .as_ref()
       .and_then(|d| d.get(&name))
-      .ok_or_else(|| miette::miette!("dependency `{name}` not found in conjure.kdl"))?;
+      .ok_or_else(|| {
+        miette::miette!("dependency `{name}` not found in conjure.kdl")
+      })?;
     ui.wrap(format!("updating {name}"), || {
       lock_remote(&ui, &mut lock, &name, dep, true)
     })?;
@@ -840,7 +958,7 @@ fn handle_build(args: &BuildArgs) -> Result<()> {
     None => None,
   };
 
-  build::build(&project, profile)
+  build::build(&project, profile, args.force)
 }
 
 fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
@@ -873,6 +991,9 @@ fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
   Ok(())
 }
 
+/// Re-enter the CLI with `CONJURE_PROFILE` set, so the wrapped subcommand runs
+/// under `args.profile`. The profile must exist; `CONJURE_PROFILE` is how the
+/// subcommand's `handle_*` will see it.
 fn handle_as(args: &AsArgs) -> Result<()> {
   let project = Project::from_file("conjure.kdl")?;
   let profiles = project
@@ -891,17 +1012,9 @@ fn handle_as(args: &AsArgs) -> Result<()> {
   }
 
   let argv0 = std::env::args().next().unwrap_or_else(|| "conjure".into());
-  let inner = Cli::parse_from([argv0].into_iter().chain(args.subcommand.iter().cloned()));
+  let inner =
+    Cli::parse_from([argv0].into_iter().chain(args.subcommand.iter().cloned()));
   run_command(&inner.command)
-}
-
-fn parse_cli() -> Cli {
-  let mut cmd = Cli::command();
-  if !has_profiles() {
-    cmd = cmd.mut_subcommand("as", |c| c.hide(true));
-  }
-  let matches = cmd.get_matches();
-  Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 fn run_command(cmd: &Commands) -> Result<()> {
@@ -919,6 +1032,16 @@ fn run_command(cmd: &Commands) -> Result<()> {
   Ok(())
 }
 
+fn parse_cli() -> Cli {
+  let mut cmd = Cli::command();
+  if !has_profiles() {
+    cmd = cmd.mut_subcommand("as", |c| c.hide(true));
+  }
+  let matches = cmd.get_matches();
+  Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+/// CLI entry point.
 pub fn run() -> Result<(), miette::Error> {
   let cli = parse_cli();
 

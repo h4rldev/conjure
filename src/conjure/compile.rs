@@ -1,6 +1,19 @@
+//! Source discovery and compilation.
+//!
+//! Turns a project's source roots into a set of compile-command entries (one per
+//! file), then runs them in parallel through the resolved [`Toolchain`]. The
+//! same [`compile_entries`] output feeds `compile_commands.json`, so the clangd
+//! database and the real build cannot drift.
+//!
+//! Object files are namespaced by profile under `.conjure/build/obj/<profile>/`
+//! and named by the source's path relative to the project, so multiple profiles
+//! coexist and a file's object is stable across runs.
+
+/***********************************************************************/
+
 use super::{
   deps::dep_include_dirs,
-  proj_parse::{Flags, Language, Profile, Project, ProjectType},
+  proj_parse::{Flags, Language, Profile, Project},
   toolchain,
   ui::{StepStatus, Ui, mark},
 };
@@ -9,13 +22,17 @@ use miette::{IntoDiagnostic, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
+  ffi::OsString,
   fs,
   path::{Path, PathBuf},
 };
 
+/***********************************************************************/
+
 pub const C_SRCS: &[&str] = &["c", "C"];
 pub const CPP_SRCS: &[&str] = &["cpp", "cc", "cxx", "c++"];
 
+/// A single `clangd`/build entry: the compile invocation for one source.
 #[derive(Debug, Serialize)]
 pub struct CompileEntry {
   directory: String,
@@ -23,7 +40,13 @@ pub struct CompileEntry {
   file: String,
 }
 
-pub fn find_sources(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) -> Result<()> {
+/// Recursively collect files under `dir` whose extension is in `exts`. An empty
+/// `exts` collects every file (used to fingerprint include trees).
+pub fn find_sources(
+  dir: &Path,
+  exts: &[&str],
+  out: &mut Vec<PathBuf>,
+) -> Result<()> {
   for entry in fs::read_dir(dir).into_diagnostic()? {
     let p = entry.into_diagnostic()?.path();
     if p.is_dir() {
@@ -39,57 +62,23 @@ pub fn find_sources(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) -> Result
   Ok(())
 }
 
-pub fn flag_list(f: Option<&Flags>) -> Vec<String> {
-  match f {
-    None => vec![],
-    Some(Flags::Append(v)) | Some(Flags::Replace(v)) => {
-      v.iter().filter(|s| !s.is_empty()).cloned().collect()
-    }
-  }
-}
-
-pub fn merged_flags(base: Option<&Flags>, profile: Option<&Flags>) -> Vec<String> {
-  let mut base = flag_list(base);
-
-  match profile {
-    None => base,
-    Some(Flags::Append(p)) => {
-      base.extend(p.iter().filter(|s| !s.is_empty()).cloned());
-      base
-    }
-    Some(Flags::Replace(p)) => p.iter().filter(|s| !s.is_empty()).cloned().collect(),
-  }
-}
-
-pub fn compile_commands(project: &Project, profile: Option<(&str, &Profile)>) -> Result<()> {
-  let root = std::env::current_dir().into_diagnostic()?;
-  let entries: Vec<_> = compile_entries(&root, &root, project, profile, vec![])?
-    .into_iter()
-    .map(|(_, e)| e)
-    .collect();
-
-  fs::write(
-    "compile_commands.json",
-    serde_json::to_string_pretty(&entries).into_diagnostic()?,
-  )
-  .into_diagnostic()?;
-
-  Ok(())
-}
-
+/// Build the compile invocation for every source in `project`.
+///
+/// `root` is the project dir (sources, object paths, and `compile_commands`
+/// `directory` all resolve against it); `cache_root` is the invocation root,
+/// used only to find dependency include dirs. Returns each object path paired
+/// with its entry so the caller can pass the objects straight to the linker.
 pub fn compile_entries(
   root: &Path,
   cache_root: &Path,
   project: &Project,
-  profile: Option<(&str, &Profile)>,
+  profile_name: &str,
   pkg_cflags: Vec<String>,
 ) -> Result<Vec<(PathBuf, CompileEntry)>> {
   let compile = project
     .compile
     .as_ref()
     .ok_or_else(|| miette::miette!("No compile section in conjure.kdl"))?;
-  let profile_name = profile.map_or("default", |(name, _)| name);
-  let profile_flags = profile.map(|(_, p)| p);
 
   let exts = match project.language {
     Language::C => C_SRCS,
@@ -110,10 +99,11 @@ pub fn compile_entries(
     )
   );
 
-  let c_flags = merged_flags(
-    compile.c_flags.as_ref(),
-    profile_flags.and_then(|p| p.c_flags.as_ref()),
-  );
+  let c_flags = compile
+    .c_flags
+    .as_ref()
+    .map(Flags::list)
+    .unwrap_or_default();
 
   let obj_dir = root
     .join(".conjure")
@@ -123,9 +113,9 @@ pub fn compile_entries(
 
   fs::create_dir_all(&obj_dir).into_diagnostic()?;
 
-  let tc = toolchain::resolve(compile);
-  // objects feeding a shared library must be compiled PIC
-  let shared_objs = matches!(project.ty, ProjectType::LibraryDynamic);
+  let tc = toolchain::resolve(compile, &project.language);
+  // Objects feeding a shared library must be position-independent.
+  let shared_objs = project.is_library() && !project.want_static();
 
   sources
     .into_iter()
@@ -139,9 +129,12 @@ pub fn compile_entries(
       let obj = obj_dir.join(&rel).with_extension(tc.obj_ext());
 
       let mut arguments = tc.cc.clone();
+      arguments.extend(tc.arch_flags());
       if let Some(std) = &compile.standard {
         arguments.extend(tc.std_args(std));
       }
+
+      arguments.extend(tc.default_c_flags(&project.language));
 
       for dir in dep_include_dirs(project, root, cache_root) {
         arguments.push(tc.include_arg(&dir.display().to_string()));
@@ -149,12 +142,8 @@ pub fn compile_entries(
 
       arguments.extend(pkg_cflags.iter().filter(|s| !s.is_empty()).cloned());
       if let Some(include) = &compile.include {
-        arguments.extend(
-          include
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|dir| tc.include_arg(dir)),
-        );
+        arguments
+          .extend(include.list().into_iter().map(|dir| tc.include_arg(&dir)));
       }
 
       if shared_objs && let Some(pic) = tc.pic_flag() {
@@ -162,7 +151,9 @@ pub fn compile_entries(
       }
 
       arguments.extend(c_flags.iter().filter(|s| !s.is_empty()).cloned());
-      arguments.extend(tc.compile_tail(&src.display().to_string(), &obj.display().to_string()));
+      arguments.extend(
+        tc.compile_tail(&src.display().to_string(), &obj.display().to_string()),
+      );
 
       let entry = CompileEntry {
         directory: root.display().to_string(),
@@ -175,7 +166,16 @@ pub fn compile_entries(
     .collect()
 }
 
-pub fn compile(ui: &Ui, dir: &Path, entries: Vec<CompileEntry>, threads: usize) -> Result<()> {
+/// Run `entries` in parallel, bounded by `threads`, under a progress bar. `env`
+/// is the toolchain environment overlay (empty for gnu; the MSVC `vcvars` set
+/// for `cl`).
+pub fn compile(
+  ui: &Ui,
+  dir: &Path,
+  entries: Vec<CompileEntry>,
+  threads: usize,
+  env: &[(OsString, OsString)],
+) -> Result<()> {
   let pb = ui.bar(
     entries.len() as u64,
     format!("Compiling {} sources", entries.len()),
@@ -195,7 +195,7 @@ pub fn compile(ui: &Ui, dir: &Path, entries: Vec<CompileEntry>, threads: usize) 
       .map(|e| {
         let name = e.file.rsplit('/').next().unwrap_or(&e.file).to_string();
         let file_pb = ui.spinner(format!("Compiling {name}"));
-        let result = ui.exec(dir, &e.arguments);
+        let result = ui.exec_env(dir, &e.arguments, env);
         if result.is_ok() {
           file_pb.finish_and_clear();
         } else {
@@ -218,4 +218,48 @@ pub fn compile(ui: &Ui, dir: &Path, entries: Vec<CompileEntry>, threads: usize) 
   ui.finish(&pb, &status, &format!("Compiled {} sources", entries.len()));
 
   result
+}
+
+/// Write `compile_commands.json` for clangd, resolving the active profile first
+/// so the database matches a real profile build.
+pub fn compile_commands(
+  project: &Project,
+  profile: Option<(&str, &Profile)>,
+) -> Result<()> {
+  let root = std::env::current_dir().into_diagnostic()?;
+  let profile_name = profile.map_or("default", |(name, _)| name);
+  let project = project.with_profile(profile.map(|(_, p)| p));
+  let entries: Vec<_> =
+    compile_entries(&root, &root, &project, profile_name, vec![])?
+      .into_iter()
+      .map(|(_, e)| e)
+      .collect();
+  fs::write(
+    "compile_commands.json",
+    serde_json::to_string_pretty(&entries).into_diagnostic()?,
+  )
+  .into_diagnostic()?;
+
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn find_sources_filters_by_extension() {
+    let dir =
+      std::env::temp_dir().join(format!("conjure_fs_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.c"), "").unwrap();
+    std::fs::write(dir.join("b.txt"), "").unwrap();
+
+    let mut out = vec![];
+    find_sources(&dir, C_SRCS, &mut out).unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(out[0].ends_with("a.c"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 }

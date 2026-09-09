@@ -1,51 +1,90 @@
 # Conjure
 
-The modern build-tool for C and C++.
+A modern build tool and dependency manager for C and C++.
+
+Conjure compiles and links C/C++ projects from a single `conjure.kdl` manifest,
+manages their dependencies (local or remote git), and produces artifacts in a
+predictable layout. It drives your existing compiler and build tools rather than
+replacing them.
 
 ## Features
 
-- Build parallelization through Rayon
-- Clangd compile-commands.json generation
-- Dependency management
-- Support for multiple build systems that aren't Conjure itself, e.g. Make, CMake, Xmake, Meson, Ninja, Autotools, etc.
-- Build profiles
-- Dependency caching and locking
-- Source code fingerprinting
-- Run commands as build profiles through Conjure's `as` subcommand
+- One manifest (`conjure.kdl`) describing sources, compiler/linker settings,
+  dependencies, profiles, and multiple co-built projects.
+- Parallel compilation (Rayon) and parallel dependency fetching.
+- Profiles that can override far more than flags: `type`, `link`, `cc`,
+  `linker`, `standard`, `arch`, sources, includes, and dependencies.
+- Dependencies from local paths or git remotes (Codeberg, GitHub, Bitbucket, or
+  any URL), pinned in a lockfile and cached per project scope.
+- Build-system interop: Make, CMake, Autotools, Meson, Ninja, Xmake, Just, a
+  free-form command, or Conjure itself (`build: conjure`).
+- Toolchain support for GCC/Clang and every GCC-cli-compatible compiler
+  (including cross compilers, `zig cc`, `tcc`, MinGW-w64), plus MSVC (`cl` /
+  `clang-cl`).
+- Content-hashed source fingerprinting so unchanged builds are skipped.
+- `compile_commands.json` generation for clangd.
+- Target architecture selection (`x86_64`, `x64`, `arm64`).
 
-## TODOs
+## Installation
 
-- [ ]  - Add Conjure as a build system
-- [ ]  - Add richer error messages
-- [ ]  - Add Conjure manifest validation
-- [ ]  - Add support for other C/C++ compilers such as MSVC
-- [ ]  - Make sub-project implementation a bit more robust
-- [ ]  - Nix & overall linux package.
+From source, with a recent Rust toolchain (edition 2024, Rust 1.95+):
 
-## Dependencies
+```sh
+cargo build --release
+# binary at target/release/conjure
+```
 
-- [clap](https://github.com/clap-rs/clap): For parsing command-line arguments
-- [git2](https://github.com/rust-lang/git2-rs): For cloning and fetching dependencies
-- [indicatif](https://github.com/console-rs/indicatif): For progress bars
-- [kdl](https://github.com/kdl-org/kdl-rs): For parsing the project definition
-- [miette](https://github.com/zkat/miette): For error handling
-- [owo-colors](https://github.com/jam1garner/owo-colors): For colored output
-- [rayon](https://github.com/rayon-rs/rayon): For parallelization
-- [serde](https://github.com/serde-rs/serde): For serialization
-- [serde-json](https://github.com/serde-rs/json): For serialization of compile-commands.json
+A Nix dev shell is provided for the build dependencies:
 
-## Runtime Dependencies
+```sh
+nix develop -c cargo build --release
+```
 
-- pkg-config: For finding system dependencies that support pkg-config (Optional)
-- Any GCC cli-compatible C/C++ compiler: For building C projects (other C compilers such as MSVC planned)
+Released binaries are published on the releases page for Linux (x86_64), macOS (x86_64, arm64), and Windows (MSVC and MinGW-w64, x86_64).
 
-## Building
+Git access uses the bundled libgit2, so no system git binary is required.
 
-Build like any Rust project with `cargo build release`.
+### Usage
 
-## Demo
+```sh
+conjure new myproject            # scaffold a new project
+conjure init                     # add a manifest to the current directory
+conjure add github owner/repo    # add a dependency
+conjure lock                     # pin dependencies (offline re-pin)
+conjure update [name]            # re-fetch and re-pin dependencies
+conjure build                    # build
+conjure build -p release         # build a profile
+conjure as release -- build      # run a command under a profile
+conjure compile-commands         # write compile_commands.json for clangd
+```
 
-Check out the [example project](./example) for a demo of Conjure in action
+### A minimal conjure.kdl:
+
+```kdl
+project {
+  name myproject
+  language c
+  type binary
+  link dynamic
+  compile {
+    standard c11
+    c_flags -Wall -Wextra
+  }
+  dependencies {
+    dep {
+      remote github "owner/repo"
+      build cmake libdep
+    }
+  }
+}
+```
+
+See `example/` for a fuller project.
+
+## Runtime dependencies
+- A C/C++ compiler: any GCC-cli-compatible compiler, or MSVC cl on Windows.
+- pkg-config (optional): resolves pkg_config entries in a manifest.
+- The build tool a dependency declares (Make, CMake, etc.), if any.
 
 ## License
 

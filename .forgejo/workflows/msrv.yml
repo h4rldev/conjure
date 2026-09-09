@@ -1,0 +1,31 @@
+# Guard the declared MSRV in Cargo.toml (`rust-version`).
+#
+# Runs on pushes and PRs to keep the floor honest: if a change or a dependency
+# bump needs a newer rustc, this fails and the `rust-version` field must be
+# raised deliberately rather than drifting silently.
+#
+# The MSRV is Linux-only to check, so this stays on Codeberg runners.
+
+name: MSRV
+
+on:
+  push:
+    branches: [main, master]
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", ".forgejo/workflows/msrv.yml"]
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "src/**"]
+  workflow_dispatch:
+
+jobs:
+  msrv:
+    runs-on: docker
+    container:
+      image: rust:1.95-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Check
+        run: cargo build --locked

@@ -1,0 +1,206 @@
+# Manual release cut: bump the version, tag, push, and open a Codeberg release
+# whose notes list the commits and new contributors since the previous tag.
+#
+# GitHub is the build farm: this repo must be mirrored to GitHub (GitHub repo
+# Settings -> Mirroring, pulling from Codeberg), so the pushed tag reaches the
+# mirror and triggers .github/workflows/release.yml. That workflow builds the
+# per-platform binaries and attaches them to both the GitHub and Codeberg
+# releases. Because GitHub mirroring is scheduled, the build may lag the tag;
+# for an immediate build, set up the GitHub repo to mirror on push, or dispatch
+# the GitHub "Release Build" workflow manually with this tag.
+#
+# The release is created as a draft by default, so its body can still be edited
+# (and anything in `notes` prepended) in the Codeberg UI before publishing.
+#
+# Requires a repository secret `CODEBERG_TOKEN` with write access (repo scope),
+# used for both the tag push and the release API call.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "How to bump the current version"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+        default: patch
+      version:
+        description: "Explicit version without leading v (only used when bump=custom)"
+        type: string
+        required: false
+      notes:
+        description: "Extra release notes, added above the generated list (optional)"
+        type: string
+        required: false
+      draft:
+        description: "Create the release as a draft so it can be edited before publishing"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Compute and print the version and notes, but do not commit, tag, push, or release"
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CODEBERG_TOKEN }}
+
+      - name: Install release tools
+        if: ${{ !inputs.dry_run }}
+        run: apt-get update && apt-get install -y --no-install-recommends jq python3
+
+      - name: Configure git
+        run: |
+          git config user.name "conjure-release"
+          git config user.email "release@conjure.invalid"
+
+      - name: Compute next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$current" ]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          IFS=. read -r major minor patch <<< "$current"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            custom)
+              if ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "bump=custom needs a version like 1.2.3 (got '$REQUESTED')" >&2
+                exit 1
+              fi
+              major="${REQUESTED%%.*}"
+              rest="${REQUESTED#*.}"
+              minor="${rest%%.*}"
+              patch="${rest#*.}"
+              ;;
+          esac
+          next="${major}.${minor}.${patch}"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
+          echo "bumping $current -> $next"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          PREAMBLE: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          prev="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            range="${prev}..HEAD"
+            commits="$(git log "$range" --pretty=format:'- %s (%h)')"
+            new_contributors="$(comm -23 \
+              <(git log "$range" --pretty=format:'%aN <%aE>' | sort -u) \
+              <(git log "$prev" --pretty=format:'%aN <%aE>' | sort -u))"
+          else
+            commits="$(git log --pretty=format:'- %s (%h)')"
+            new_contributors="$(git log --pretty=format:'%aN <%aE>' | sort -u)"
+          fi
+
+          {
+            if [ -n "$PREAMBLE" ]; then
+              printf '%s\n\n' "$PREAMBLE"
+            fi
+            echo "## What's Changed"
+            echo
+            printf '%s\n' "$commits"
+            if [ -n "$new_contributors" ]; then
+              echo
+              echo "## New Contributors"
+              echo
+              printf '%s\n' "$new_contributors" | sed 's/^/- /'
+            fi
+            if [ -n "$prev" ]; then
+              echo
+              echo "**Full Changelog**: https://codeberg.org/${GITHUB_REPOSITORY}/compare/${prev}...${TAG}"
+            fi
+          } > notes.md
+          echo "wrote notes.md"
+
+      - name: Bump Cargo.toml and Cargo.lock
+        if: ${{ !inputs.dry_run }}
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \".*\"/s//version = \"${NEXT}\"/" Cargo.toml
+          python3 - "$NEXT" <<'PY'
+          import re, sys
+          new = sys.argv[1]
+          text = open("Cargo.lock").read()
+          text, n = re.subn(
+              r'(name = "conjure"\nversion = ")[^"]+(")',
+              lambda m: m.group(1) + new + m.group(2),
+              text,
+          )
+          if n != 1:
+              raise SystemExit(f"expected 1 conjure entry in Cargo.lock, found {n}")
+          open("Cargo.lock", "w").write(text)
+          PY
+
+      - name: Commit, tag, push
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${TAG}"
+          git tag -a "$TAG" -m "conjure ${NEXT}"
+          git push origin HEAD
+          git push origin "$TAG"
+
+      - name: Create Codeberg release
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          draft="false"
+          if [ "$DRAFT" = "true" ]; then draft="true"; fi
+          jq -n \
+            --arg tag "$TAG" \
+            --rawfile body notes.md \
+            --argjson draft "$draft" \
+            '{tag_name: $tag, name: $tag, body: $body, draft: $draft, prerelease: false}' \
+            > payload.json
+          curl -fsS -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json \
+            "https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}/releases"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          echo "Dry run: would tag ${TAG} and create a release with notes:"
+          echo
+          cat notes.md

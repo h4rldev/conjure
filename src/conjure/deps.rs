@@ -1,22 +1,60 @@
+//! External dependency resolution, fetching, and building.
+//!
+//! A dependency is either a local path or a remote git repo. Remote deps are
+//! pinned in `conjure.lock`; an unlocked dep is cloned, resolved, and pinned
+//! during the build automatically, so `conjure build` works without a prior
+//! `conjure lock`. Fetching happens concurrently (network-bound) while building
+//! stays serial in manifest order and drives each dep's own build system - or
+//! conjure itself, for `build: conjure` deps.
+//!
+//! All paths are anchored per project scope so co-built siblings and the root
+//! project share one cache under the invocation root without colliding. Cache
+//! writes for dependencies are keyed by the resolved commit (remote) or a source
+//! fingerprint (local), combined with the static/dynamic tag, so flips rebuild.
+//!
+//! Remote deps are always fetched (their trees supply headers), but they are
+//! only *built* when the project actually links them. A static library archives
+//! objects and never links, so its dependencies are fetched and then skipped.
+
+/***********************************************************************/
+
 use super::{
   build::{self, BuildCtx},
   dep_cache::DepCache,
   fingerprint, git, link, lock,
-  proj_parse::{BuildSystem, Dependency, Profile, Project, ProjectType, Remote, Transport},
+  proj_parse::{
+    BuildSystem, Dependency, Flags, Linkage, Profile, Project, ProjectType,
+    Remote, Transport,
+  },
   ui::{StepStatus, Ui},
 };
+use indicatif::ProgressBar;
 use miette::{IntoDiagnostic, Result};
+use rayon::prelude::*;
 use std::{
   fs,
   path::{Path, PathBuf},
   process::Command,
 };
 
+/***********************************************************************/
+
+/// The dep clone/cache home under a project root.
 fn cache_home(root: &Path) -> PathBuf {
   root.join(".conjure").join("deps")
 }
 
-/// Per-project cache scope: project dir relative to the invocation root.
+/// The clone dir for a scope. `.` (the invocation root project) maps to the
+/// cache dir itself - never append a literal `/.`.
+fn scope_dir(base: &Path, scope: &str) -> PathBuf {
+  if scope == "." {
+    base.to_path_buf()
+  } else {
+    base.join(scope)
+  }
+}
+
+/// Per-project cache scope: the project dir relative to the invocation root.
 /// `"."` for the top-level project, `"libs/sub1"` for a co-built sibling.
 fn scope_of(root: &Path, dir: &Path) -> String {
   dir
@@ -27,33 +65,37 @@ fn scope_of(root: &Path, dir: &Path) -> String {
     .unwrap_or(".".to_string())
 }
 
-fn dep_dir(name: &str, dep: &Dependency, dir: &Path, root: &Path, scope: &str) -> PathBuf {
+/// A dependency's source dir: local deps are relative to the project dir,
+/// remote deps live under the scope's cache dir.
+fn dep_dir(
+  name: &str,
+  dep: &Dependency,
+  dir: &Path,
+  root: &Path,
+  scope: &str,
+) -> PathBuf {
   match &dep.local {
     Some(p) => dir.join(p),
-    None => cache_home(root).join(scope).join(name),
+    None => scope_dir(&cache_home(root), scope).join(name),
   }
 }
 
-pub fn dep_include_dirs(project: &Project, dir: &Path, root: &Path) -> Vec<PathBuf> {
-  let scope = scope_of(root, dir);
-  let mut dirs = vec![];
+/// The clone URL for a remote dependency.
+fn dep_url(dep: &Dependency, name: &str) -> Result<String> {
+  let (host, path) = match dep.remote.as_ref() {
+    Some(Remote::Codeberg(p)) => ("codeberg", p),
+    Some(Remote::GitHub(p)) => ("github", p),
+    Some(Remote::BitBucket(p)) => ("bitbucket", p),
+    Some(Remote::Git(p)) => ("git", p),
+    None => return Err(miette::miette!("Dependency `{name}` has no remote")),
+  };
 
-  if let Some(deps) = &project.dependencies {
-    for (name, dep) in deps {
-      let base = dep_dir(name, dep, dir, root, &scope);
+  let t = match dep.transport {
+    Some(Transport::Ssh) | None => "ssh",
+    Some(Transport::Https) => "https",
+  };
 
-      match &dep.include {
-        Some(dirs_list) => dirs.extend(dirs_list.iter().map(|d| base.join(d))),
-        None => {
-          dirs.push(base.clone());
-          dirs.push(base.join("include"));
-          dirs.push(base.join("build"));
-        }
-      }
-    }
-  }
-
-  dirs
+  Ok(git::remote_url(host, path, t))
 }
 
 fn is_shared(name: &str) -> bool {
@@ -63,9 +105,9 @@ fn is_shared(name: &str) -> bool {
     name.ends_with(".dll")
   } else {
     name.ends_with(".so")
-      || name
-        .split_once(".so.")
-        .is_some_and(|(_, ver)| ver.chars().all(|c| c.is_ascii_digit() || c == '.'))
+      || name.split_once(".so.").is_some_and(|(_, ver)| {
+        ver.chars().all(|c| c.is_ascii_digit() || c == '.')
+      })
   }
 }
 
@@ -77,6 +119,7 @@ fn is_static(name: &str) -> bool {
   }
 }
 
+/// Record the first shared and first static library found anywhere under `dir`.
 fn collect_libs(
   dir: &Path,
   shared: &mut Option<PathBuf>,
@@ -97,8 +140,8 @@ fn collect_libs(
   Ok(())
 }
 
-/// Pick the dep's library matching the linkage policy. Deterministic, where
-/// the old readdir-order walk was arbitrary.
+/// Pick the dep's library matching the linkage policy. Deterministic, where a
+/// bare readdir walk would be arbitrary.
 fn find_lib(dir: &Path, want_static: bool) -> Result<PathBuf> {
   let (mut shared, mut statik) = (None, None);
   collect_libs(dir, &mut shared, &mut statik)?;
@@ -106,8 +149,8 @@ fn find_lib(dir: &Path, want_static: bool) -> Result<PathBuf> {
   match (want_static, statik, shared) {
     (true, Some(p), _) => Ok(p),
     (true, None, Some(_)) => Err(miette::miette!(
-      help = "build the dependency to also emit a static (.a) archive, or link it dynamically",
-      "static build requested but `{}` only produced a shared library",
+      help = "Build the dependency to also emit a static (.a) archive, or link it dynamically",
+      "Static build requested but `{}` only produced a shared library",
       dir.display()
     )),
     (false, _, Some(p)) => Ok(p),
@@ -116,6 +159,8 @@ fn find_lib(dir: &Path, want_static: bool) -> Result<PathBuf> {
   }
 }
 
+/// Split pkg-config output into `(cflags, libs)`: `-l`/`-L`/`-Wl,`/`-pthread`
+/// are link inputs, everything else is a compile flag.
 fn split_cflags_and_libs(output: &str) -> (Vec<String>, Vec<String>) {
   let mut cflags = vec![];
   let mut libs = vec![];
@@ -135,6 +180,8 @@ fn split_cflags_and_libs(output: &str) -> (Vec<String>, Vec<String>) {
   (cflags, libs)
 }
 
+/// How to build a dep: an explicit `build:` wins; otherwise a dep-root
+/// `conjure.kdl` means build it with conjure, else the make default.
 fn dep_build_system(dep: &Dependency, dep_dir: &Path) -> BuildSystem {
   match &dep.build {
     Some(b) => b.clone(),
@@ -143,6 +190,7 @@ fn dep_build_system(dep: &Dependency, dep_dir: &Path) -> BuildSystem {
   }
 }
 
+/// Run an external build system for a dep, then return its produced library.
 fn build_dep(
   ui: &Ui,
   dir: &Path,
@@ -281,8 +329,8 @@ fn build_dep(
 
     BuildSystem::Conjure(_) => {
       return Err(miette::miette!(
-        help = "this is a bug: conjure deps are dispatched before `build_dep`",
-        "conjure dependency reached the external build path in `{}`",
+        help = "This is a bug: conjure deps are dispatched before `build_dep`",
+        "Conjure dependency reached the external build path in `{}`",
         dir.display()
       ));
     }
@@ -297,13 +345,293 @@ fn build_dep(
   find_lib(dir, want_static)
 }
 
+/// How a remote dep is pinned for this build.
+enum Pin {
+  /// Already locked: check out this commit.
+  Commit(String),
+  /// Unlocked: resolve the manifest ref, then pin HEAD.
+  Resolve,
+}
+
+/// A remote dep scheduled for the parallel fetch phase.
+struct RemoteFetch<'a> {
+  name: &'a str,
+  dep: &'a Dependency,
+  dep_dir: PathBuf,
+  url: String,
+  pin: Pin,
+}
+
+/// What a fetch produced for a previously-unlocked dep.
+struct Resolved {
+  r#ref: Option<String>,
+  commit: String,
+}
+
+/// Fetch a dep and resolve the commit to pin it at: mirrors `conjure lock`,
+/// checking out the manifest ref if present and then pinning HEAD.
+fn resolve_remote(
+  name: &str,
+  dep: &Dependency,
+  dep_dir: &Path,
+  url: &str,
+  bar: Option<&ProgressBar>,
+) -> Result<Resolved> {
+  git::ensure_cloned_at(dep_dir.parent().unwrap(), url, name, bar)?;
+  if let Some(r) = &dep.r#ref {
+    git::checkout(dep_dir, r)?;
+  }
+
+  let commit = git::resolve_head(dep_dir)?;
+  let r#ref = git::head_ref(dep_dir)?;
+  git::checkout(dep_dir, &commit)?;
+  Ok(Resolved { r#ref, commit })
+}
+
+/// Fetch remote deps concurrently. Bars are pre-created in manifest order so
+/// their display slots are stable, and completions are reported through
+/// `Ui::println` so they line up with the running bars. Returns resolutions
+/// aligned with `fetches` (`None` for already-locked entries).
+fn fetch_remotes(
+  ui: &Ui,
+  fetches: &[RemoteFetch<'_>],
+  threads: usize,
+) -> Result<Vec<Option<Resolved>>> {
+  if fetches.is_empty() {
+    return Ok(vec![]);
+  }
+
+  let name_w = fetches.iter().map(|f| f.name.len()).max().unwrap_or(0);
+  let bars: Vec<ProgressBar> = fetches
+    .iter()
+    .map(|f| ui.fetch_bar(f.name, name_w, "objects"))
+    .collect();
+
+  let pool = rayon::ThreadPoolBuilder::new()
+    .num_threads(threads)
+    .build()
+    .into_diagnostic()?;
+
+  let result: Result<Vec<Option<Resolved>>> = pool.install(|| {
+    fetches
+      .par_iter()
+      .zip(bars.par_iter())
+      .map(|(f, bar)| -> Result<Option<Resolved>> {
+        let resolved = match &f.pin {
+          Pin::Commit(commit) => {
+            git::ensure_cloned_at(
+              f.dep_dir.parent().unwrap(),
+              &f.url,
+              f.name,
+              Some(bar),
+            )?;
+            git::checkout(&f.dep_dir, commit)?;
+            None
+          }
+          Pin::Resolve => Some(resolve_remote(
+            f.name,
+            f.dep,
+            &f.dep_dir,
+            &f.url,
+            Some(bar),
+          )?),
+        };
+
+        bar.finish_and_clear();
+        ui.println(Some(&StepStatus::Success), format!("Fetched {}", f.name))?;
+        Ok(resolved)
+      })
+      .collect()
+  });
+
+  if result.is_err() {
+    for (f, bar) in fetches.iter().zip(&bars) {
+      if !bar.is_finished() {
+        bar.finish_and_clear();
+      }
+      let _ = ui.println(
+        Some(&StepStatus::Failure),
+        format!("Failed to fetch {}", f.name),
+      );
+    }
+  }
+
+  result
+}
+
+/// Parent context a `build: conjure` dependency inherits and scopes against.
+pub struct ConjureCtx<'a> {
+  pub parent: &'a Project,
+  pub dir: &'a Path,  // parent project dir
+  pub root: &'a Path, // invocation root
+  pub profile: Option<(&'a str, &'a Profile)>,
+}
+
+/// Synthesize a manifestless dep project: the parent's compile settings
+/// inherited, with `src` from `dep.src` (or the parent's roots) and includes
+/// absolutized against the parent dir plus the dep's own includes.
+fn manifestless_project(
+  parent: &Project,
+  dep: &Dependency,
+  name: &str,
+  parent_dir: &Path,
+) -> Result<Project> {
+  let parent_compile = parent.compile.as_ref().ok_or_else(|| {
+    miette::miette!("Parent project has no compile section to inherit")
+  })?;
+
+  let mut compile = parent_compile.clone();
+  compile.src = Some(Flags::Append(
+    dep
+      .src
+      .clone()
+      .unwrap_or_else(|| parent_compile.src_roots()),
+  ));
+  let mut include = vec![];
+  if let Some(parent_inc) = &parent_compile.include {
+    for inc in parent_inc.list() {
+      include.push(parent_dir.join(inc).display().to_string());
+    }
+  }
+  if let Some(dep_inc) = &dep.include {
+    include.extend(dep_inc.iter().filter(|s| !s.is_empty()).cloned());
+  }
+  compile.include = (!include.is_empty()).then_some(Flags::Append(include));
+
+  Ok(Project {
+    name: name.to_string(),
+    language: parent.language.clone(),
+    ty: ProjectType::Library,
+    link: if parent.want_static() {
+      Linkage::Static
+    } else {
+      Linkage::Dynamic
+    },
+    compile: Some(compile),
+    ..Default::default()
+  })
+}
+
+/// Build a dependency with conjure itself, in-process. Mode A: the dep root
+/// carries its own `conjure.kdl`. Mode B (manifestless): the synthesized
+/// [`manifestless_project`].
+///
+/// The dep's own profile matching the active name is applied when it has one,
+/// otherwise it builds with no profile.
+fn build_conjure_dep<'a>(
+  ui: &Ui,
+  ctx: &ConjureCtx<'a>,
+  name: &str,
+  dep: &Dependency,
+) -> Result<PathBuf> {
+  let dep_dir =
+    dep_dir(name, dep, ctx.dir, ctx.root, &scope_of(ctx.root, ctx.dir));
+  let kdl = dep_dir.join("conjure.kdl");
+
+  let child = if kdl.is_file() {
+    Project::from_file(&kdl)?
+  } else {
+    manifestless_project(ctx.parent, dep, name, ctx.dir)?
+  };
+
+  let profile_name = ctx.profile.map_or("default", |(n, _)| n);
+  let child_profile = ctx.profile.and_then(|(n, _)| {
+    child
+      .profiles
+      .as_ref()
+      .and_then(|m| m.get(n))
+      .map(|p| (n, p))
+  });
+  let effective = child.with_profile(child_profile.map(|(_, p)| p));
+
+  miette::ensure!(
+    effective.is_library(),
+    help = "Conjure dependencies must be libraries (`type library`)",
+    "dependency `{name}` is a binary conjure project, which can't be linked"
+  );
+  miette::ensure!(
+    !(ctx.parent.want_static() && !effective.want_static()),
+    help = "Set the dependency to `link static`, or make this project dynamic",
+    "dependency `{name}` is shared but this project links statically"
+  );
+
+  ui.println(
+    Some(&StepStatus::Info),
+    format!("Building {} with conjure", name),
+  )?;
+  let child_ctx = BuildCtx {
+    project: &child,
+    dir: dep_dir.to_path_buf(),
+    root: ctx.root.to_path_buf(),
+    profile: child_profile,
+    force: false,
+  };
+  build::build_ctx(&child_ctx)?;
+  Ok(link::library_path(&effective, ctx.root, profile_name, true))
+}
+
+/// One dependency's resolved work item for a build.
+struct DepJob<'a> {
+  name: &'a str,
+  dep: &'a Dependency,
+  work: DepWork,
+}
+
+enum DepWork {
+  /// Already built and cached: reuse the artifact.
+  Cached(PathBuf),
+  /// Source present locally; still needs building.
+  Local { dep_dir: PathBuf, key: String },
+  /// Remote, already fetched; still needs building.
+  Remote { dep_dir: PathBuf, key: String },
+}
+
+/// Include dirs conjure hands the compiler for a project's deps: the dep's
+/// listed includes, or the conventional root/include/build dirs when unspecified.
+pub fn dep_include_dirs(
+  project: &Project,
+  dir: &Path,
+  root: &Path,
+) -> Vec<PathBuf> {
+  let scope = scope_of(root, dir);
+  let mut dirs = vec![];
+
+  let mut deps: Vec<(&String, &Dependency)> = project
+    .dependencies
+    .as_ref()
+    .map(|d| d.iter().collect())
+    .unwrap_or_default();
+  deps.sort_by(|a, b| a.0.cmp(b.0));
+  for (name, dep) in deps {
+    let base = dep_dir(name, dep, dir, root, &scope);
+
+    match &dep.include {
+      Some(dirs_list) => dirs.extend(dirs_list.iter().map(|d| base.join(d))),
+      None => {
+        dirs.push(base.clone());
+        dirs.push(base.join("include"));
+        dirs.push(base.join("build"));
+      }
+    }
+  }
+
+  dirs
+}
+
+/// Build every dependency and return their libraries in manifest order.
+///
+/// Three passes: fetch remote misses concurrently (auto-locking unlocked deps),
+/// resolve each dep to a cache hit or a build job, then build serially and
+/// record cache entries. Cache and lock writes stay on the main thread.
+///
+/// Returns an empty list for a static library, which needs dep headers but
+/// never links dep libraries - the fetch still runs so those headers exist.
 pub fn build_deps(
   ui: &Ui,
   proj: &Project,
   dir: &Path,
   root: &Path,
   profile: Option<(&str, &Profile)>,
-  want_static: bool,
 ) -> Result<Vec<PathBuf>> {
   let deps = match &proj.dependencies {
     Some(d) if !d.is_empty() => d,
@@ -317,13 +645,119 @@ pub fn build_deps(
     )
   })?;
 
-  let threads = compile
-    .threads
-    .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+  let threads = compile.threads.unwrap_or_else(|| {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+  });
 
+  let want_static = proj.want_static();
   let scope = scope_of(root, dir);
   let dep_base = cache_home(root);
   let key_tag = if want_static { "s" } else { "d" };
+  let mut lock = lock::LockFile::load(dir.join("conjure.lock"))?;
+  let mut cache = DepCache::load(root);
+  let link_deps = !(proj.is_library() && want_static);
+
+  // Pass 0: schedule fetches for remote deps that are neither cached nor locked.
+  let mut fetches: Vec<RemoteFetch> = Vec::new();
+  for (name, dep) in deps {
+    if dep.local.is_some() {
+      continue;
+    }
+    let dep_dir = scope_dir(&dep_base, &scope).join(name);
+    let url = dep_url(dep, name)?;
+    match lock.entries().get(name) {
+      Some(locked) => {
+        let key = format!("{}:{key_tag}", locked.commit);
+        if cache.hit(&scope, name, &key).is_some() {
+          continue; // cached; nothing to fetch
+        }
+        fetches.push(RemoteFetch {
+          name,
+          dep,
+          dep_dir,
+          url,
+          pin: Pin::Commit(locked.commit.clone()),
+        });
+      }
+      None => fetches.push(RemoteFetch {
+        name,
+        dep,
+        dep_dir,
+        url,
+        pin: Pin::Resolve,
+      }),
+    }
+  }
+
+  let resolved = fetch_remotes(ui, &fetches, threads)?;
+  let mut relocked = false;
+  for (f, r) in fetches.iter().zip(&resolved) {
+    if let Some(r) = r {
+      lock.lock(
+        f.name,
+        f.dep.remote.clone(),
+        f.dep.transport,
+        r.r#ref.clone(),
+        r.commit.clone(),
+      );
+      ui.println(Some(&StepStatus::Info), format!("Locked {}", f.name))?;
+      relocked = true;
+    }
+  }
+  if relocked {
+    lock.save(dir.join("conjure.lock"))?;
+  }
+
+  if !link_deps {
+    return Ok(vec![]);
+  }
+
+  // Pass 1: resolve each dep to a cache hit or a build job.
+  let mut jobs: Vec<DepJob> = Vec::with_capacity(deps.len());
+  for (name, dep) in deps {
+    let work = match &dep.local {
+      Some(p) => {
+        let dep_dir = dir.join(p);
+        let key = format!("{}:{key_tag}", fingerprint::dir_key(&dep_dir)?);
+        match cache.hit(&scope, name, &key) {
+          Some(lib) => {
+            ui.println(
+              Some(&StepStatus::Info),
+              format!("Reusing cached for {name}"),
+            )?;
+            DepWork::Cached(lib)
+          }
+          None => DepWork::Local { dep_dir, key },
+        }
+      }
+      None => {
+        let locked = lock.entries().get(name).ok_or_else(|| {
+          miette::miette!(
+            "Dependency `{name}` is not locked; run `conjure lock`"
+          )
+        })?;
+
+        let key = format!("{}:{key_tag}", locked.commit);
+        match cache.hit(&scope, name, &key) {
+          Some(lib) => {
+            ui.println(
+              Some(&StepStatus::Info),
+              format!("Reusing cached for {name}"),
+            )?;
+            DepWork::Cached(lib)
+          }
+          None => DepWork::Remote {
+            dep_dir: scope_dir(&dep_base, &scope).join(name),
+            key,
+          },
+        }
+      }
+    };
+
+    jobs.push(DepJob { name, dep, work });
+  }
+
+  // Pass 2: build in manifest order, recording cache entries.
   let dep_ctx = ConjureCtx {
     parent: proj,
     dir,
@@ -331,72 +765,23 @@ pub fn build_deps(
     profile,
   };
 
-  let lock = lock::LockFile::load(dir.join("conjure.lock"))?;
-  let mut cache = DepCache::load(root);
-  let mut libs = vec![];
-
-  for (name, dep) in deps {
-    let (dep_dir, key) = match &dep.local {
-      Some(p) => {
-        let dep_dir = dir.join(p);
-        let key = format!("{}:{key_tag}", fingerprint::dir_key(&dep_dir)?);
-        if let Some(lib) = cache.hit(&scope, name, &key) {
-          ui.println(
-            Some(&StepStatus::Info),
-            format!("Reusing cached for {name}"),
-          )?;
-          libs.push(lib);
-          continue;
+  let mut libs = Vec::with_capacity(jobs.len());
+  for job in &jobs {
+    let lib = match &job.work {
+      DepWork::Cached(lib) => lib.clone(),
+      DepWork::Local { dep_dir, .. } | DepWork::Remote { dep_dir, .. } => {
+        let system = dep_build_system(job.dep, dep_dir);
+        if matches!(system, BuildSystem::Conjure(_)) {
+          build_conjure_dep(ui, &dep_ctx, job.name, job.dep)?
+        } else {
+          build_dep(ui, dep_dir, &system, threads, want_static)?
         }
-        (dep_dir, Some(key))
-      }
-      None => {
-        let locked = lock.entries().get(name).ok_or_else(|| {
-          miette::miette!("Dependency `{name}` is not locked; run `conjure lock`")
-        })?;
-
-        let key = format!("{}:{key_tag}", locked.commit);
-        if let Some(lib) = cache.hit(&scope, name, &key) {
-          ui.println(
-            Some(&StepStatus::Info),
-            format!("Reusing cached for {name}"),
-          )?;
-          libs.push(lib);
-          continue;
-        }
-
-        let (host, path) = match &locked.remote {
-          Some(Remote::Codeberg(p)) => ("codeberg", p),
-          Some(Remote::GitHub(p)) => ("github", p),
-          Some(Remote::BitBucket(p)) => ("bitbucket", p),
-          Some(Remote::Git(p)) => ("git", p),
-          None => return Err(miette::miette!("Dependency `{name}` has no remote")),
-        };
-
-        let t = match locked.transport {
-          Some(Transport::Ssh) | None => "ssh",
-          Some(Transport::Https) => "https",
-        };
-
-        // project-scoped clone under the root cache
-        let dep_dir = git::ensure_cloned_at(
-          Some(ui),
-          &dep_base.join(&scope),
-          &git::remote_url(host, path, t),
-          name,
-        )?;
-        git::checkout(&dep_dir, &locked.commit)?;
-        (dep_dir, Some(key))
       }
     };
-    let system = dep_build_system(dep, &dep_dir);
-    let lib = if matches!(system, BuildSystem::Conjure(_)) {
-      build_conjure_dep(ui, &dep_ctx, name, dep)?
-    } else {
-      build_dep(ui, &dep_dir, &system, threads, want_static)?
-    };
-    if let Some(k) = key {
-      cache.insert(&scope, name, k, lib.clone());
+
+    if let DepWork::Local { key, .. } | DepWork::Remote { key, .. } = &job.work
+    {
+      cache.insert(&scope, job.name, key.clone(), lib.clone());
     }
     libs.push(lib);
   }
@@ -405,18 +790,26 @@ pub fn build_deps(
   Ok(libs)
 }
 
+/// Resolve `pkg_config` entries for a project's deps into `(cflags, libs)`.
+///
+/// A static library never links dep libraries, so it resolves `--cflags` only
+/// and returns empty libs.
 pub fn resolve_pkg_config(
   project: &Project,
   dir: &Path,
   root: &Path,
-  want_static: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
-  let deps = match &project.dependencies {
-    Some(d) => d,
-    None => return Ok((vec![], vec![])),
-  };
+  let mut deps: Vec<(&String, &Dependency)> = project
+    .dependencies
+    .as_ref()
+    .map(|d| d.iter().collect())
+    .unwrap_or_default();
+
+  deps.sort_by(|a, b| a.0.cmp(b.0));
 
   let scope = scope_of(root, dir);
+  // A static library uses dep cflags but never links dep libs.
+  let want_libs = !(project.is_library() && project.want_static());
   let mut cflags = vec![];
   let mut libs = vec![];
 
@@ -437,8 +830,12 @@ pub fn resolve_pkg_config(
       .env("PKG_CONFIG_PATH", pkg_path)
       .arg("--cflags")
       .arg("--libs");
-    if want_static {
-      cmd.arg("--static");
+    if want_libs {
+      // `--static` only affects `--libs`, so it is requested together.
+      cmd.arg("--libs");
+      if project.want_static() {
+        cmd.arg("--static");
+      }
     }
     let out = cmd.args(pkgs).output().into_diagnostic()?;
 
@@ -456,115 +853,88 @@ pub fn resolve_pkg_config(
   Ok((cflags, libs))
 }
 
-pub struct ConjureCtx<'a> {
-  pub parent: &'a Project,
-  pub dir: &'a Path,  // parent project dir
-  pub root: &'a Path, // invocation root
-  pub profile: Option<(&'a str, &'a Profile)>,
-}
+#[cfg(test)]
+mod tests {
+  use super::{cache_home, dep_build_system, scope_dir, scope_of};
+  use crate::conjure::proj_parse::{BuildSystem, Dependency};
+  use std::path::Path;
 
-/// Build a dependency with conjure itself, in-process. Mode A: the dep root
-/// carries its own conjure.kdl. Mode B (manifestless): compile settings are
-/// inherited from the parent and only `src`/`include` are dep-specific.
-fn build_conjure_dep<'a>(
-  ui: &Ui,
-  ctx: &ConjureCtx<'a>,
-  name: &str,
-  dep: &Dependency,
-) -> Result<PathBuf> {
-  let dep_dir = dep_dir(name, dep, ctx.dir, ctx.root, &scope_of(ctx.root, ctx.dir));
-  let kdl = dep_dir.join("conjure.kdl");
+  #[test]
+  fn scope_dir_collapses_root_scope() {
+    let base = Path::new("/p/.conjure/deps");
 
-  let (child, profile_name) = if kdl.is_file() {
-    // Mode A: the dep has its own manifest.
-    let child = Project::from_file(&kdl)?;
-    miette::ensure!(
-      matches!(
-        child.ty,
-        ProjectType::LibraryDynamic | ProjectType::LibraryStatic
-      ),
-      help = "conjure dependencies must be libraries (`type library dynamic` or `library static`)",
-      "dependency `{name}` is a binary conjure project, which can't be linked"
-    );
-    miette::ensure!(
-      !(want_static(ctx.parent) && matches!(child.ty, ProjectType::LibraryDynamic)),
-      help = "set the dependency's conjure type to `library static`, or make this project dynamic",
-      "dependency `{name}` is shared but this project links statically"
-    );
-    let profile_name = ctx.profile.map_or("default", |(n, _)| n);
-    (child, profile_name)
-  } else {
-    // Mode B: manifestless — inherit parent compile settings.
-    let child = manifestless_project(ctx.parent, dep, name, ctx.dir)?;
-    let profile_name = ctx.profile.map_or("default", |(n, _)| n);
-    (child, profile_name)
-  };
-
-  ui.println(
-    Some(&StepStatus::Info),
-    format!("Building {} with conjure", name),
-  )?;
-
-  let ctx = BuildCtx {
-    project: &child,
-    dir: dep_dir.to_path_buf(),
-    root: ctx.root.to_path_buf(),
-    profile: ctx.profile,
-  };
-
-  build::build_ctx(&ctx)?;
-  Ok(link::library_path(&child, &ctx.root, profile_name))
-}
-
-fn want_static(project: &Project) -> bool {
-  matches!(
-    project.ty,
-    ProjectType::BinaryStatic | ProjectType::LibraryStatic
-  )
-}
-
-/// Synthesize a manifestless dep project: parent's compile settings inherited,
-/// `src` roots = dep.src or the parent's compile src (default `["src"]`),
-/// include dirs absolutized against the parent dir plus the dep's own includes.
-fn manifestless_project(
-  parent: &Project,
-  dep: &Dependency,
-  name: &str,
-  parent_dir: &Path,
-) -> Result<Project> {
-  let parent_compile = parent
-    .compile
-    .as_ref()
-    .ok_or_else(|| miette::miette!("parent project has no compile section to inherit"))?;
-
-  let mut compile = parent_compile.clone();
-  compile.src = Some(
-    dep
-      .src
-      .clone()
-      .unwrap_or_else(|| parent_compile.src_roots()),
-  );
-
-  let mut include = vec![];
-  if let Some(parent_inc) = &parent_compile.include {
-    for inc in parent_inc.iter().filter(|s| !s.is_empty()) {
-      include.push(parent_dir.join(inc).display().to_string());
-    }
+    assert_eq!(scope_dir(base, "."), base);
+    assert_eq!(scope_dir(base, "libs/sub1"), base.join("libs/sub1"));
   }
-  if let Some(dep_inc) = &dep.include {
-    include.extend(dep_inc.iter().filter(|s| !s.is_empty()).cloned());
-  }
-  compile.include = (!include.is_empty()).then_some(include);
 
-  Ok(Project {
-    name: name.to_string(),
-    language: parent.language.clone(),
-    ty: if want_static(parent) {
-      ProjectType::LibraryStatic
-    } else {
-      ProjectType::LibraryDynamic
-    },
-    compile: Some(compile),
-    ..Default::default()
-  })
+  #[test]
+  fn scope_of_root_is_dot() {
+    assert_eq!(scope_of(Path::new("/r"), Path::new("/r")), ".");
+    assert_eq!(scope_of(Path::new("/r"), Path::new("/r/libs/s")), "libs/s");
+  }
+
+  #[test]
+  fn cache_home_is_root_conjure_deps() {
+    assert_eq!(cache_home(Path::new("/r")), Path::new("/r/.conjure/deps"));
+  }
+
+  #[test]
+  fn build_system_explicit_wins_over_manifest() {
+    let dep = Dependency {
+      local: Some(".".into()),
+      build: Some(BuildSystem::CMake(None)),
+      remote: None,
+      transport: None,
+      include: None,
+      src: None,
+      pkg_config: None,
+      r#ref: None,
+    };
+
+    assert_eq!(
+      dep_build_system(&dep, Path::new("/does/not/matter")),
+      BuildSystem::CMake(None)
+    );
+  }
+
+  #[test]
+  fn build_system_defaults_to_make_without_manifest() {
+    let dep = Dependency {
+      local: Some(".".into()),
+      build: None,
+      remote: None,
+      transport: None,
+      include: None,
+      src: None,
+      pkg_config: None,
+      r#ref: None,
+    };
+
+    assert_eq!(
+      dep_build_system(&dep, Path::new("/definitely/not/here")),
+      BuildSystem::Make(None)
+    );
+  }
+
+  #[test]
+  fn build_system_detects_conjure_manifest() {
+    let dir =
+      std::env::temp_dir().join(format!("conjure_dep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("conjure.kdl"), "").unwrap();
+
+    let dep = Dependency {
+      local: Some(".".into()),
+      build: None,
+      remote: None,
+      transport: None,
+      include: None,
+      src: None,
+      pkg_config: None,
+      r#ref: None,
+    };
+
+    assert_eq!(dep_build_system(&dep, &dir), BuildSystem::Conjure(None));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 }
