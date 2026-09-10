@@ -190,6 +190,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # An earlier (possibly aborted) run may have created the release with
+            # stale notes. Re-apply the generated body before re-uploading.
+            if [ -s gh-notes.md ]; then
+              gh release edit "$TAG" --title "$TAG" --notes-file gh-notes.md
+            fi
             gh release upload "$TAG" dist/* --clobber
             exit 0
           fi
@@ -233,10 +238,31 @@ jobs:
                   -H "Content-Type: application/json" \
                   -d @- "${api}"
             rid="$(find_id)"
+          else
+            # Re-apply the body on an existing release; a prior partial run may
+            # have left stale notes. Omitting `draft` preserves its state, so a
+            # re-run never un-publishes or re-drafts a release.
+            jq -n --arg t "$TAG" --rawfile b cb-notes.md \
+              '{tag_name: $t, name: $t, body: $b}' \
+              | curl -fsS -X PATCH \
+                  -H "Authorization: token ${CB_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d @- "${api}/${rid}"
           fi
 
+          # Assets of the same name cannot be uploaded twice, and re-runs are
+          # expected, so drop any existing matches first.
+          existing="$(curl -fsS -H "Authorization: token ${CB_TOKEN}" \
+            "${api}/${rid}/assets" 2>/dev/null || true)"
           for f in dist/*; do
             name="$(basename "$f")"
+            old="$(printf '%s\n' "$existing" \
+              | jq -r --arg n "$name" '.[] | select(.name == $n) | .id' 2>/dev/null \
+              | head -n1)"
+            if [ -n "$old" ] && [ "$old" != "null" ]; then
+              curl -fsS -X DELETE -H "Authorization: token ${CB_TOKEN}" \
+                "${api}/${rid}/assets/${old}" >/dev/null
+            fi
             curl -fsS -X POST \
               -H "Authorization: token ${CB_TOKEN}" \
               -F "attachment=@$f" \
