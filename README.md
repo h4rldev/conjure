@@ -58,7 +58,7 @@ conjure as release -- build      # run a command under a profile
 conjure compile-commands         # write compile_commands.json for clangd
 ```
 
-### A minimal conjure.kdl:
+### A minimal conjure.kdl
 
 ```kdl
 project {

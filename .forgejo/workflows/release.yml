@@ -48,7 +48,7 @@ on:
 
 jobs:
   release:
-    runs-on: docker
+    runs-on: codeberg-small
     container:
       image: rust:1-bookworm
     steps:
@@ -169,7 +169,17 @@ jobs:
         run: |
           set -euo pipefail
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): ${TAG}"
+          # Releasing the current version unchanged (e.g. the first 0.1.0) leaves
+          # nothing staged; only commit when the bump actually changed something.
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): ${TAG}"
+          else
+            echo "version unchanged; tagging ${TAG} without a commit"
+          fi
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} already exists" >&2
+            exit 1
+          fi
           git tag -a "$TAG" -m "conjure ${NEXT}"
           git push origin HEAD
           git push origin "$TAG"
