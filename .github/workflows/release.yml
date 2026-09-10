@@ -80,9 +80,17 @@ jobs:
         if: runner.os == 'Windows' && !matrix.msys
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl libssh2
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           "VCPKGRS_DYNAMIC=0" >> $env:GITHUB_ENV
+          # libgit2's https uses vcpkg openssl: openssl-sys finds it via vcpkg's
+          # find_package, which reads port metadata and so handles OpenSSL 3's
+          # version-suffixed DLLs. libssh2-sys instead probes for a hardcoded
+          # version-less `libssl`/`libcrypto` pair including `libssl.dll`, which
+          # vcpkg's OpenSSL 3 does not ship (`libssl-3-x64.dll`), so its vcpkg
+          # path always panics. Disable it; libssh2-sys then builds vendored and
+          # uses Windows CNG for ssh (no OpenSSL needed there).
+          "VCPKGRS_NO_LIBSSH2=1" >> $env:GITHUB_ENV
 
       - uses: msys2/setup-msys2@v2
         if: matrix.msys
