@@ -44,10 +44,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-gnu
             msys: true
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             openssl_dir: /usr/local/opt/openssl@3
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             openssl_dir: /opt/homebrew/opt/openssl@3
     runs-on: ${{ matrix.os }}
