@@ -79,7 +79,7 @@ project {
 }
 ```
 
-See `example/` for a fuller project.
+See [example/](example/) for a more complete example.
 
 ## Runtime dependencies
 - A C/C++ compiler: any GCC-cli-compatible compiler, or MSVC cl on Windows.
