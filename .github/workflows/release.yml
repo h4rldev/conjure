@@ -68,6 +68,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install openssl@3
 
+      # Homebrew's openssl@3 is keg-only, so point openssl-sys at it. Do this
+      # via GITHUB_ENV only for macOS: a bare `env: OPENSSL_DIR: ${{ matrix.openssl_dir }}`
+      # sets the variable to an empty string on Linux/Windows, and openssl-sys
+      # treats a set-but-empty OPENSSL_DIR as a relative path and panics.
+      - name: Configure OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_DIR=${{ matrix.openssl_dir }}" >> "$GITHUB_ENV"
+
       - name: Install deps (Windows MSVC)
         if: runner.os == 'Windows' && !matrix.msys
         shell: pwsh
@@ -88,8 +96,6 @@ jobs:
 
       - name: Build
         if: ${{ !matrix.msys }}
-        env:
-          OPENSSL_DIR: ${{ matrix.openssl_dir }}
         run: |
           rustup target add "${{ matrix.target }}"
           cargo build --release --target "${{ matrix.target }}"
@@ -148,6 +154,28 @@ jobs:
           sha256sum dist/* > dist/SHA256SUMS
           ls -l dist
 
+      - name: Extract release notes
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          msg="$(git tag -l --format='%(contents)' "$TAG")"
+          : > gh-notes.md
+          : > cb-notes.md
+          if printf '%s\n' "$msg" | grep -q 'conjure:github'; then
+            printf '%s\n' "$msg" \
+              | awk '/conjure:github/{f=1; next} /conjure:codeberg/{f=0} f' > gh-notes.md
+            printf '%s\n' "$msg" | awk '/conjure:codeberg/{f=1; next} f' > cb-notes.md
+          else
+            printf '%s\n' "$msg" > gh-notes.md
+            printf '%s\n' "$msg" > cb-notes.md
+          fi
+          # A hand-pushed lightweight tag has no annotation; Codeberg falls back
+          # to the GitHub body below.
+          [ -s cb-notes.md ] || cp gh-notes.md cb-notes.md
+          echo "--- github ---"; cat gh-notes.md; echo
+          echo "--- codeberg ---"; cat cb-notes.md
+
       - name: Create or update GitHub release
         env:
           DRAFT_INPUT: ${{ inputs.draft }}
@@ -157,10 +185,8 @@ jobs:
             gh release upload "$TAG" dist/* --clobber
             exit 0
           fi
-          # Notes live on the annotated tag cut.yml created; fall back to
-          # GitHub's generated notes for a hand-pushed lightweight tag.
-          if [ -n "$(git tag -l --format='%(contents)' "$TAG")" ]; then
-            args=(--notes-from-tag)
+          if [ -s gh-notes.md ]; then
+            args=(--notes-file gh-notes.md)
           else
             args=(--generate-notes)
           fi
@@ -172,9 +198,15 @@ jobs:
           gh release create "$TAG" --title "$TAG" "${args[@]}" dist/*
 
       - name: Mirror assets to the Codeberg release
+        env:
+          DRAFT_INPUT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
           api="https://codeberg.org/api/v1/repos/${CODEBERG_REPO}/releases"
+
+          # Match the GitHub release's draft state: tag pushes (no input) draft.
+          draft="true"
+          if [ "${DRAFT_INPUT:-}" = "false" ]; then draft="false"; fi
 
           # Find the release by tag. The list endpoint is used rather than
           # /tags/ so a draft release is found.
@@ -186,9 +218,8 @@ jobs:
 
           rid="$(find_id || true)"
           if [ -z "$rid" ] || [ "$rid" = "null" ]; then
-            body="$(gh release view "$TAG" --json body -q .body)"
-            jq -n --arg t "$TAG" --arg b "$body" \
-              '{tag_name: $t, name: $t, body: $b, draft: true, prerelease: false}' \
+            jq -n --arg t "$TAG" --rawfile b cb-notes.md --argjson draft "$draft" \
+              '{tag_name: $t, name: $t, body: $b, draft: $draft, prerelease: false}' \
               | curl -fsS -X POST \
                   -H "Authorization: token ${CB_TOKEN}" \
                   -H "Content-Type: application/json" \
