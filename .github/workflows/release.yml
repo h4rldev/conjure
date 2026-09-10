@@ -1,11 +1,11 @@
 # Build release binaries and attach them to the release on both hosts.
 #
-# Triggered by a `v*` tag, which the Codeberg release workflow pushes and the
-# push-mirror propagates here. Builds Linux (gnu), macOS (x86_64 + arm64), and
-# Windows (both the MSVC and the MinGW/GNU ABIs), then a publish job packages
-# them with checksums, creates the GitHub release, and mirrors the assets onto
-# the matching Codeberg release (creating it as a draft if the bump workflow
-# did not, or if the tag was pushed by hand).
+# Triggered by the `v*` tag that cut.yml pushes to Codeberg and the push-mirror
+# propagates here, or manually for an existing tag. Builds Linux (gnu), macOS
+# (x86_64 + arm64), and Windows (both the MSVC and the MinGW/GNU ABIs), then a
+# publish job packages them with checksums, creates the GitHub release with the
+# notes carried on the annotated tag, and mirrors the assets onto the matching
+# Codeberg release (creating it as a draft if it does not exist).
 #
 # Requires a `CODEBERG_TOKEN` secret with write access to the Codeberg repo.
 
@@ -20,6 +20,10 @@ on:
         description: "Existing tag to (re)build and publish"
         type: string
         required: true
+      draft:
+        description: "Create the releases as drafts so they can be edited before publishing (tag pushes always draft)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -49,6 +53,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       # git2 pulls libgit2 + libssh2 (both vendored by their -sys crates) and
       # openssl (from the system, hence the per-OS installs below).
@@ -112,6 +118,11 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CB_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
     steps:
+      # For the tag annotation that carries the release notes.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: raw
@@ -138,13 +149,27 @@ jobs:
           ls -l dist
 
       - name: Create or update GitHub release
+        env:
+          DRAFT_INPUT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" --title "$TAG" --generate-notes dist/*
+            exit 0
           fi
+          # Notes live on the annotated tag cut.yml created; fall back to
+          # GitHub's generated notes for a hand-pushed lightweight tag.
+          if [ -n "$(git tag -l --format='%(contents)' "$TAG")" ]; then
+            args=(--notes-from-tag)
+          else
+            args=(--generate-notes)
+          fi
+          # Tag pushes (the normal path) default to a draft; a manual dispatch
+          # may pass draft=false.
+          draft="$DRAFT_INPUT"
+          [ -z "$draft" ] && draft=true
+          if [ "$draft" = "true" ]; then args+=(--draft); fi
+          gh release create "$TAG" --title "$TAG" "${args[@]}" dist/*
 
       - name: Mirror assets to the Codeberg release
         run: |
@@ -152,7 +177,7 @@ jobs:
           api="https://codeberg.org/api/v1/repos/${CODEBERG_REPO}/releases"
 
           # Find the release by tag. The list endpoint is used rather than
-          # /tags/ so a draft release (default from the bump workflow) is found.
+          # /tags/ so a draft release is found.
           find_id() {
             curl -fsS -H "Authorization: token ${CB_TOKEN}" "${api}?limit=100" \
               | jq -r --arg t "$TAG" '.[] | select(.tag_name == $t) | .id' \

@@ -1,21 +1,14 @@
-# Manual release cut: bump the version, tag, push, and open a Codeberg release
-# whose notes list the commits and new contributors since the previous tag.
+# Cut a release: bump the version, annotate a tag with the generated notes, and
+# push both to Codeberg (canonical). Codeberg push-mirrors to GitHub, which then
+# triggers release.yml to build and publish.
 #
-# GitHub is the build farm: this repo must be mirrored to GitHub (GitHub repo
-# Settings -> Mirroring, pulling from Codeberg), so the pushed tag reaches the
-# mirror and triggers .github/workflows/release.yml. That workflow builds the
-# per-platform binaries and attaches them to both the GitHub and Codeberg
-# releases. Because GitHub mirroring is scheduled, the build may lag the tag;
-# for an immediate build, set up the GitHub repo to mirror on push, or dispatch
-# the GitHub "Release Build" workflow manually with this tag.
+# Nothing is ever pushed to GitHub from here; GitHub only ever receives refs via
+# the Codeberg mirror.
 #
-# The release is created as a draft by default, so its body can still be edited
-# (and anything in `notes` prepended) in the Codeberg UI before publishing.
-#
-# Requires a repository secret `CODEBERG_TOKEN` with write access (repo scope),
-# used for both the tag push and the release API call.
+# Requires a repository secret `CODEBERG_TOKEN`: a Forgejo token with write
+# access to CODEBERG_REPO.
 
-name: Release
+name: Cut Release
 
 on:
   workflow_dispatch:
@@ -37,29 +30,24 @@ on:
         description: "Extra release notes, added above the generated list (optional)"
         type: string
         required: false
-      draft:
-        description: "Create the release as a draft so it can be edited before publishing"
-        type: boolean
-        default: true
       dry_run:
-        description: "Compute and print the version and notes, but do not commit, tag, push, or release"
+        description: "Compute and print the version and notes, but do not commit, tag, or push"
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
+env:
+  CODEBERG_REPO: h4rl/conjure
+
 jobs:
-  release:
-    runs-on: codeberg-small
-    container:
-      image: rust:1-bookworm
+  cut:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.CODEBERG_TOKEN }}
-
-      - name: Install release tools
-        if: ${{ !inputs.dry_run }}
-        run: apt-get update && apt-get install -y --no-install-recommends jq python3
 
       - name: Configure git
         run: |
@@ -135,7 +123,7 @@ jobs:
             fi
             if [ -n "$prev" ]; then
               echo
-              echo "**Full Changelog**: https://codeberg.org/${GITHUB_REPOSITORY}/compare/${prev}...${TAG}"
+              echo "**Full Changelog**: https://codeberg.org/${CODEBERG_REPO}/compare/${prev}...${TAG}"
             fi
           } > notes.md
           echo "wrote notes.md"
@@ -161,11 +149,12 @@ jobs:
           open("Cargo.lock", "w").write(text)
           PY
 
-      - name: Commit, tag, push
+      - name: Commit, tag, push to Codeberg
         if: ${{ !inputs.dry_run }}
         env:
           TAG: ${{ steps.version.outputs.tag }}
           NEXT: ${{ steps.version.outputs.next }}
+          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
         run: |
           set -euo pipefail
           git add Cargo.toml Cargo.lock
@@ -180,37 +169,18 @@ jobs:
             echo "tag ${TAG} already exists" >&2
             exit 1
           fi
-          git tag -a "$TAG" -m "conjure ${NEXT}"
-          git push origin HEAD
-          git push origin "$TAG"
-
-      - name: Create Codeberg release
-        if: ${{ !inputs.dry_run }}
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-          DRAFT: ${{ inputs.draft }}
-        run: |
-          set -euo pipefail
-          draft="false"
-          if [ "$DRAFT" = "true" ]; then draft="true"; fi
-          jq -n \
-            --arg tag "$TAG" \
-            --rawfile body notes.md \
-            --argjson draft "$draft" \
-            '{tag_name: $tag, name: $tag, body: $body, draft: $draft, prerelease: false}' \
-            > payload.json
-          curl -fsS -X POST \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d @payload.json \
-            "https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}/releases"
+          # Annotate with the notes so the build workflow can reuse them via
+          # `gh release create --notes-from-tag` without a second notes step.
+          git tag -a "$TAG" -F notes.md
+          git remote add codeberg "https://h4rl:${TOKEN}@codeberg.org/${CODEBERG_REPO}.git"
+          git push codeberg HEAD
+          git push codeberg "$TAG"
 
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          echo "Dry run: would tag ${TAG} and create a release with notes:"
+          echo "Dry run: would tag ${TAG} and push to Codeberg with notes:"
           echo
           cat notes.md
