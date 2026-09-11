@@ -1,5 +1,5 @@
 [package]
-name = "conjure"
+name = "conjure-build"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
@@ -10,7 +10,7 @@ readme = "README.md"
 authors = ["h4rl"]
 keywords = ["build", "cpp", "c", "build-system", "dependency-manager"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
-exclude = [".forgejo", ".github", "example", "example2", "flake.nix", "flake.lock", ".direnv", ".envrc"]
+exclude = [".github", "example", "example2", "flake.nix", "flake.lock", ".direnv", ".envrc"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -22,6 +22,10 @@ owo-colors = "4.3.0"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+[[bin]]
+name = "conjure"
+path = "src/main.rs"
 
 [profile.release]
 lto = true

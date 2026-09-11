@@ -269,12 +269,12 @@ jobs:
           new = sys.argv[1]
           text = open("Cargo.lock").read()
           text, n = re.subn(
-              r'(name = "conjure"\nversion = ")[^"]+(")',
+              r'(name = "conjure-build"\nversion = ")[^"]+(")',
               lambda m: m.group(1) + new + m.group(2),
               text,
           )
           if n != 1:
-              raise SystemExit(f"expected 1 conjure entry in Cargo.lock, found {n}")
+              raise SystemExit(f"expected 1 conjure-build entry in Cargo.lock, found {n}")
           open("Cargo.lock", "w").write(text)
           PY
 
