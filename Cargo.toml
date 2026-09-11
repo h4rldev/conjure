@@ -1,6 +1,6 @@
 [package]
 name = "conjure-build"
-version = "0.1.2"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A modern build tool and dependency manager for C and C++."
