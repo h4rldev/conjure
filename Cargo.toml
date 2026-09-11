@@ -14,8 +14,16 @@ exclude = [".github", "example", "example2", "flake.nix", "flake.lock", ".direnv
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/conjure-{ version }-{ target }{ archive-suffix }"
-bin-dir = "{ bin }{ binary-ext }"
+bin-dir = "conjure-{ version }-{ target }{ binary-ext }"
 pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/conjure-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/conjure-{ version }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
