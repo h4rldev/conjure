@@ -15,7 +15,7 @@ exclude = [".github", "example", "example2", "flake.nix", "flake.lock", ".direnv
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/conjure-{ version }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
-pkg-fmt = "tar.gz"
+pkg-fmt = "tgz"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
