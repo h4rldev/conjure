@@ -14,7 +14,10 @@
 # Trusted publishing can only be configured once the crate exists, so the first
 # release must be published by hand (`cargo publish`).
 #
-# Requires a `CODEBERG_TOKEN` secret with write access to the Codeberg repo.
+# Requires `CODEBERG_TOKEN` (write access to the Codeberg repo), `GPG_PRIVATE_KEY`
+# (armored private signing key), and `GPG_PASSPHRASE` (its passphrase). The GPG
+# key signs SHA256SUMS so packagers can authenticate the artifacts against a
+# fingerprint instead of trusting the download host alone.
 
 name: Release Build
 
@@ -46,6 +49,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: windows-latest
@@ -155,18 +160,62 @@ jobs:
           mkdir -p dist
           for dir in raw/*/; do
             target="$(basename "$dir")"
-            bin="$(find "$dir" -type f | head -n1)"
             base="conjure-${version}-${target}"
             if [[ "$target" == *windows* ]]; then
+              # The uploaded artifact is the whole `conjure*` glob, which also
+              # matches the `.d` depfile and a `.pdb`, so pick the executable by
+              # name; an arbitrary `find | head -n1` once shipped a depfile.
+              bin="$(find "$dir" -type f -iname 'conjure.exe' | head -n1)"
+              [ -n "$bin" ] || { echo "no conjure.exe in $dir" >&2; exit 1; }
               cp "$bin" "dist/${base}.exe"
               (cd dist && zip -q "${base}.zip" "${base}.exe" && rm "${base}.exe")
             else
+              bin="$(find "$dir" -type f -name 'conjure' | head -n1)"
+              [ -n "$bin" ] || { echo "no conjure binary in $dir" >&2; exit 1; }
               cp "$bin" "dist/${base}"
               tar -czf "dist/${base}.tar.gz" -C dist "${base}"
               rm "dist/${base}"
             fi
           done
-          sha256sum dist/* > dist/SHA256SUMS
+          # Bare filenames, so `sha256sum -c SHA256SUMS` works from the directory
+          # the assets were downloaded into. `sha256sum dist/*` would record the
+          # `dist/` prefix and fail verification.
+          (cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+          ls -l dist
+
+      - name: Sign checksums with GPG
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+          fingerprint="$(gpg --batch --list-secret-keys --with-colons \
+            | awk -F: '/^fpr:/ { print $10; exit }')"
+          if [ -z "$fingerprint" ]; then
+            echo "no secret key found in GPG_PRIVATE_KEY" >&2
+            exit 1
+          fi
+          echo "signing with $fingerprint"
+
+          # Detached armored signature over the manifest. A packager putting
+          # `SHA256SUMS.asc` in `source` and this fingerprint in `validpgpkeys`
+          # lets `makepkg` verify the artifacts even if the download host or the
+          # PKGBUILD checksums are later changed.
+          (cd dist && gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --local-user "$fingerprint" \
+            --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS)
+
+          # Ship the public half too, so users import the exact signing key
+          # rather than trusting a keyserver lookup.
+          gpg --batch --armor --export "$fingerprint" > dist/conjure-signing-key.asc
+
+          gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
           ls -l dist
 
       - name: Extract release notes

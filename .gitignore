@@ -2,11 +2,14 @@ target
 .conjure
 .direnv
 .cache
+.gnupg-release
+result
 bin
 
 *.lock
 *.kdl
 *.json
+*.asc
 
 !conjure.kdl
 !flake.lock
