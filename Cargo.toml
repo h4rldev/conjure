@@ -12,6 +12,11 @@ keywords = ["build", "cpp", "c", "build-system", "dependency-manager"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
 exclude = [".github", "example", "example2", "flake.nix", "flake.lock", ".direnv", ".envrc"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/conjure-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tar.gz"
+
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
