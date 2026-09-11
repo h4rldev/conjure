@@ -92,9 +92,17 @@ jobs:
         if: runner.os == 'Windows' && !matrix.msys
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl
+          # Static OpenSSL from vcpkg, release-only. The default `x64-windows`
+          # triplet is dynamic, which put libssl-3-x64.dll/libcrypto-3-x64.dll
+          # requirements on the exe that the release zip does not carry, and it
+          # built both -dbg and -rel ports (wasted time; vcpkg-rs only ever reads
+          # the release libs). `x64-windows-static-md-release` fixes both: static
+          # library linkage, dynamic CRT (matches Rust's default), release-only.
+          # `VCPKGRS_TRIPLET` makes openssl-sys and the install agree; no
+          # `VCPKGRS_DYNAMIC` (it is presence-based, so `=0` forces dynamic).
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md-release
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          "VCPKGRS_DYNAMIC=0" >> $env:GITHUB_ENV
+          "VCPKGRS_TRIPLET=x64-windows-static-md-release" >> $env:GITHUB_ENV
           # libgit2's https uses vcpkg openssl: openssl-sys finds it via vcpkg's
           # find_package, which reads port metadata and so handles OpenSSL 3's
           # version-suffixed DLLs. libssh2-sys instead probes for a hardcoded
@@ -125,6 +133,15 @@ jobs:
         shell: msys2 {0}
         env:
           OPENSSL_DIR: /mingw64
+          # MSYS2 ships both the import libs (libssl.dll.a) and the static ones
+          # (libssl.a); force static so no libssl-3-x64.dll/libcrypto-3-x64.dll
+          # is needed at runtime. libz-sys already builds zlib from source on
+          # pc-windows-gnu, so the zlib symbols resolve too.
+          OPENSSL_STATIC: "1"
+          # Statically link libgcc_eh/winpthread instead of depending on
+          # libgcc_s_seh-1.dll / libwinpthread-1.dll, which are absent on a
+          # clean Windows machine.
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
           rustup target add "${{ matrix.target }}"
