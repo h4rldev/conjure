@@ -6,7 +6,6 @@ rust-version = "1.95"
 description = "A modern build tool and dependency manager for C and C++."
 license = "BSD-3-Clause"
 repository = "https://codeberg.org/h4rl/conjure"
-readme = "README.md"
 authors = ["h4rl"]
 keywords = ["build", "cpp", "c", "build-system", "dependency-manager"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
@@ -35,6 +34,7 @@ owo-colors = "4.3.0"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+thiserror = "2.0.20"
 
 [[bin]]
 name = "conjure"

@@ -13,6 +13,7 @@
 
 use super::{
   deps::dep_include_dirs,
+  diag::ReadDir,
   proj_parse::{Flags, Language, Profile, Project},
   toolchain,
   ui::{StepStatus, Ui, mark},
@@ -47,7 +48,10 @@ pub fn find_sources(
   exts: &[&str],
   out: &mut Vec<PathBuf>,
 ) -> Result<()> {
-  for entry in fs::read_dir(dir).into_diagnostic()? {
+  for entry in fs::read_dir(dir).map_err(|source| ReadDir {
+    path: dir.to_path_buf(),
+    source,
+  })? {
     let p = entry.into_diagnostic()?.path();
     if p.is_dir() {
       find_sources(&p, exts, out)?;

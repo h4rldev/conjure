@@ -116,7 +116,7 @@ pub fn remote_url(host: &str, path: &str, transport: &str) -> String {
     "codeberg" => "codeberg.org",
     "github" => "github.com",
     "bitbucket" => "bitbucket.org",
-    _ => path,
+    _ => return path.to_string(),
   };
 
   match transport {

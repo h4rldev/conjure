@@ -78,3 +78,62 @@ pub fn make_proj(path: impl AsRef<Path>, project: Project) -> Result<()> {
 
   Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+  use super::{make_proj, std_major};
+  use crate::conjure::proj_parse::{Compile, Language, Project};
+
+  #[test]
+  fn std_major_parses_cpp_standards() {
+    assert_eq!(std_major("c++23"), Some(23));
+    assert_eq!(std_major("gnu++20"), Some(20));
+    assert_eq!(std_major("c11"), None);
+    assert_eq!(std_major("c++xx"), None);
+  }
+
+  #[test]
+  fn make_proj_picks_hello_by_language_and_standard() {
+    let dir =
+      std::env::temp_dir().join(format!("conjure_proj_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let c = Project {
+      name: "c".into(),
+      language: Language::C,
+      compile: Some(Compile::default()),
+      ..Default::default()
+    };
+    make_proj(&dir, c).unwrap();
+    assert!(dir.join("src/main.c").is_file());
+    assert!(dir.join("conjure.kdl").is_file());
+
+    let cpp23 = Project {
+      name: "cpp23".into(),
+      language: Language::Cpp,
+      compile: Some(Compile {
+        standard: Some("c++23".into()),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    make_proj(&dir, cpp23).unwrap();
+    let src = std::fs::read_to_string(dir.join("src/main.cpp")).unwrap();
+    assert!(src.contains("import std;"));
+
+    let cpp17 = Project {
+      name: "cpp17".into(),
+      language: Language::Cpp,
+      compile: Some(Compile {
+        standard: Some("c++17".into()),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    make_proj(&dir, cpp17).unwrap();
+    let src = std::fs::read_to_string(dir.join("src/main.cpp")).unwrap();
+    assert!(src.contains("#include <iostream>"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}

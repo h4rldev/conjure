@@ -119,4 +119,12 @@ mod tests {
     lock.retain(|name| name == "b");
     assert_eq!(lock.entries().len(), 1);
   }
+
+  #[test]
+  fn load_missing_file_is_empty() {
+    let path = std::env::temp_dir()
+      .join(format!("conjure_lock_{}.kdl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    assert!(LockFile::load(&path).unwrap().entries().is_empty());
+  }
 }

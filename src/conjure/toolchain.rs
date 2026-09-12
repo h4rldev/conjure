@@ -780,9 +780,10 @@ pub fn resolve(compile: &Compile, language: &Language) -> Toolchain {
 #[cfg(test)]
 mod tests {
   use super::{
-    Arch, Gnu, Language, Microsoft, Toolchain, parse_link_line, parse_set,
-    words,
+    Arch, Compile, Driver, Gnu, Language, LinkJob, Microsoft, Toolchain,
+    driver_for, parse_link_line, parse_set, real_tool, resolve, words,
   };
+  use std::path::PathBuf;
 
   #[test]
   fn words_handles_quotes_and_escapes() {
@@ -891,5 +892,239 @@ gcc version 15.3.0\n\
       driver: Box::new(Microsoft { arch: Arch::X86 }),
     };
     assert!(tc.arch_flags().is_empty());
+  }
+
+  fn gnu(arch: Arch) -> Gnu {
+    Gnu { arch }
+  }
+  fn ms(arch: Arch) -> Microsoft {
+    Microsoft { arch }
+  }
+
+  #[test]
+  fn words_handles_edge_cases() {
+    assert_eq!(words("a   b"), vec!["a", "b"]);
+    assert_eq!(words("a b\\"), vec!["a", "b"]); // trailing backslash
+    assert_eq!(words("\"a b"), vec!["a b"]); // unterminated quote
+    assert_eq!(words(r#""a\"b""#), vec!["a\"b"]); // escape inside quotes
+    assert_eq!(words("\"\""), Vec::<String>::new()); // empty quoted token
+  }
+
+  #[test]
+  fn parse_link_line_strips_plumbing() {
+    assert!(parse_link_line("gcc version 15\nnothing here").is_err());
+
+    let line = "collect2 --eh-frame-hdr -m elf_x86_64 -o /dev/null \
+                -plugin /x/plugin.so -plugin-opt=-pass-through=-lgcc \
+                /dev/null -lc -lgcc";
+    let (prefix, suffix) = parse_link_line(line).unwrap();
+    assert_eq!(prefix, vec!["--eh-frame-hdr", "-m", "elf_x86_64"]);
+    assert_eq!(suffix, vec!["-lc", "-lgcc"]);
+    assert!(prefix.iter().chain(&suffix).all(|t| !t.contains("plugin")));
+  }
+
+  #[test]
+  fn compile_side_methods_per_dialect() {
+    let g = gnu(Arch::X86_64);
+    assert_eq!(g.obj_ext(), "o");
+    assert_eq!(g.std_args("c11"), vec!["-std=c11"]);
+    assert_eq!(g.include_arg("inc"), "-Iinc");
+    assert_eq!(g.compile_tail("a.c", "a.o"), vec!["-c", "a.c", "-o", "a.o"]);
+    assert_eq!(g.pic_flag().as_deref(), Some("-fPIC"));
+    assert!(g.default_c_flags(&Language::C).is_empty());
+
+    let m = ms(Arch::X86_64);
+    assert_eq!(m.obj_ext(), "obj");
+    assert_eq!(m.std_args("c17"), vec!["/std:c17"]);
+    assert_eq!(m.include_arg("inc"), "/Iinc");
+    assert_eq!(
+      m.compile_tail("a.c", "a.obj"),
+      vec!["/c", "a.c", "/Fo:a.obj"]
+    );
+    assert_eq!(m.pic_flag(), None);
+    assert!(m.arch_flags().is_empty());
+    assert_eq!(m.default_c_flags(&Language::Cpp), vec!["/nologo", "/EHsc"]);
+  }
+
+  #[test]
+  fn gnu_flag_translation() {
+    let g = gnu(Arch::Native);
+    assert_eq!(
+      g.translate_flag("-Wl,-z,relro"),
+      Some(vec!["-z".into(), "relro".into()])
+    );
+    assert_eq!(g.translate_flag("-pthread"), Some(vec!["-lpthread".into()]));
+    assert_eq!(
+      g.translate_flag("-rdynamic"),
+      Some(vec!["-export-dynamic".into()])
+    );
+    assert_eq!(
+      g.translate_flag("-m32"),
+      Some(vec!["-m".into(), "elf_i386".into()])
+    );
+    assert_eq!(
+      g.translate_flag("-m64"),
+      Some(vec!["-m".into(), "elf_x86_64".into()])
+    );
+    assert_eq!(
+      g.translate_flag("-mx32"),
+      Some(vec!["-m".into(), "elf32_x86_64".into()])
+    );
+    assert_eq!(g.translate_flag("-Bstatic"), Some(vec!["-Bstatic".into()]));
+    assert_eq!(
+      g.translate_flag("-Bdynamic"),
+      Some(vec!["-Bdynamic".into()])
+    );
+    assert_eq!(g.translate_flag("-lm"), None);
+
+    assert!(!g.needs_driver("-Wl,x"));
+    assert!(!g.needs_driver("-Wl,-z,relro"));
+    assert!(!g.needs_driver("-Xlinker"));
+    assert!(!g.needs_driver("-pthread"));
+    assert!(g.needs_driver("-fuse-ld=mold"));
+    assert!(g.needs_driver("-static-libgcc"));
+    assert!(!g.needs_driver("-lm"));
+
+    let toks = vec![
+      "-Xlinker".to_string(),
+      "--as-needed".to_string(),
+      "-Wl,-z,relro".to_string(),
+      "-lm".to_string(),
+    ];
+    assert_eq!(
+      g.translated(&toks),
+      vec!["--as-needed", "-z", "relro", "-lm"]
+    );
+  }
+
+  #[test]
+  fn gnu_driver_link_args_matrix() {
+    let prefix = vec!["gcc".to_string()];
+    let objects = vec![PathBuf::from("a.o")];
+    let libs = vec![PathBuf::from("./libx.a")];
+    let extra = vec!["-lm".to_string()];
+    let flags = vec!["-O2".to_string()];
+    let flags_static = vec!["-static".to_string()];
+
+    let job = LinkJob {
+      shared: false,
+      static_flag: None,
+      prefix: &prefix,
+      objects: &objects,
+      libs: &libs,
+      extra_libs: &extra,
+      flags: &flags,
+      out: "prog",
+    };
+    assert_eq!(
+      gnu(Arch::Native).driver_link_args(&job),
+      vec!["gcc", "a.o", "./libx.a", "-lm", "-O2", "-o", "prog"]
+    );
+
+    let job = LinkJob {
+      shared: true,
+      ..job
+    };
+    let argv = gnu(Arch::Native).driver_link_args(&job);
+    assert!(argv.iter().any(|a| a == "-shared" || a == "-dynamiclib"));
+
+    let job = LinkJob {
+      shared: false,
+      static_flag: Some("-static".into()),
+      prefix: &prefix,
+      objects: &objects,
+      libs: &libs,
+      extra_libs: &extra,
+      flags: &flags,
+      out: "prog",
+    };
+    let argv = gnu(Arch::Native).driver_link_args(&job);
+    assert_eq!(argv.iter().filter(|a| *a == "-static").count(), 1);
+
+    let job = LinkJob {
+      flags: &flags_static,
+      ..job
+    };
+    let argv = gnu(Arch::Native).driver_link_args(&job);
+    assert_eq!(argv.iter().filter(|a| *a == "-static").count(), 1);
+  }
+
+  #[test]
+  fn msvc_link_args_matrix() {
+    let prefix = vec!["cl".to_string()];
+    let objects = vec![PathBuf::from("a.obj")];
+    let libs = vec![PathBuf::from("x.lib")];
+    let extra = vec!["user32.lib".to_string()];
+    let flags = vec!["/DEBUG".to_string()];
+    let empty: Vec<String> = vec![];
+
+    let job = LinkJob {
+      shared: false,
+      static_flag: Some("/MT".into()),
+      prefix: &prefix,
+      objects: &objects,
+      libs: &libs,
+      extra_libs: &extra,
+      flags: &flags,
+      out: "prog.exe",
+    };
+    let argv = ms(Arch::X86_64).driver_link_args(&job);
+    for want in ["/nologo", "/MT", "/Fe:prog.exe", "/link", "/DEBUG"] {
+      assert!(argv.contains(&want.to_string()), "missing {want}");
+    }
+    assert!(!argv.contains(&"/LD".to_string()));
+
+    let job = LinkJob {
+      shared: true,
+      static_flag: None,
+      flags: &empty,
+      ..job
+    };
+    let argv = ms(Arch::X86_64).driver_link_args(&job);
+    assert!(argv.contains(&"/LD".to_string()));
+    assert!(!argv.contains(&"/link".to_string()));
+
+    let raw = ms(Arch::X86_64).raw_link_args(&prefix, &job).unwrap();
+    assert_eq!(raw[0], "cl");
+    assert!(raw.contains(&"/DLL".to_string()));
+    assert!(raw.contains(&"/OUT:prog.exe".to_string()));
+  }
+
+  #[test]
+  fn resolve_and_driver_selection() {
+    assert_eq!(real_tool(&["ccache".into(), "gcc".into()]), "gcc");
+    assert_eq!(real_tool(&["/usr/bin/cl".into()]), "cl");
+    assert_eq!(real_tool(&[]), "cc");
+    assert_eq!(driver_for("icx", Arch::Native).obj_ext(), "obj");
+    assert_eq!(driver_for("gcc", Arch::Native).obj_ext(), "o");
+
+    let c = Compile {
+      cc: Some("clang-cl".into()),
+      ..Default::default()
+    };
+    assert_eq!(resolve(&c, &Language::C).obj_ext(), "obj");
+
+    let c = Compile {
+      cc: Some("ccache gcc".into()),
+      ..Default::default()
+    };
+    let tc = resolve(&c, &Language::C);
+    assert_eq!(tc.cc, vec!["ccache", "gcc"]);
+    assert_eq!(tc.obj_ext(), "o");
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn msvc_env_is_captured_on_windows() {
+    assert!(
+      !Microsoft { arch: Arch::Native }.env().is_empty(),
+      "vswhere found no Visual Studio; the MSVC driver cannot work"
+    );
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn default_compiler_is_msvc_when_visual_studio_is_present() {
+    assert_eq!(default_compiler(&Language::C), "cl");
   }
 }

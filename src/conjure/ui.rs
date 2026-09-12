@@ -15,7 +15,7 @@
 /***********************************************************************/
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 use std::{
   borrow::Cow,
@@ -27,6 +27,8 @@ use std::{
 };
 
 /***********************************************************************/
+
+const SPIN_CHARS: &str = "⠉⠙⠘⠰⢠⣠⣀⣄⡄⠆⠃⠋";
 
 /// Leading glyph for a status line, or the message unchanged when `status` is
 /// `None` (e.g. forwarded tool output).
@@ -75,7 +77,12 @@ impl Ui {
       .stderr(Stdio::piped())
       .spawn()
       .into_diagnostic()
-      .wrap_err(format!("Failed to run `{joined}`"))?;
+      .map_err(|e| {
+        miette::miette!(
+          help = "Is it in path?",
+          "Failed to run `{joined}`: {e}"
+        )
+      })?;
 
     // Drain both pipes on separate threads so a chatty child can't deadlock on
     // a full pipe buffer while we wait for it to exit.
@@ -114,20 +121,15 @@ impl Ui {
     }
   }
 
-  /// An indeterminate spinner showing elapsed time - for a step with unknown
-  /// duration (a single compile, a link).
   pub fn spinner(&self, msg: impl Into<Cow<'static, str>>) -> ProgressBar {
     let pb = self.mp.add(ProgressBar::new_spinner());
-    let mut finito = vec![" ", "⠁", "⠉", "⠙", "⠛", "⠟", "⠿", "⡿", "⣿"];
-    let mut part2 = finito.iter().rev().cloned().collect::<Vec<_>>();
-    finito.append(&mut part2);
 
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(
       ProgressStyle::default_spinner()
         .template("{spinner:.green} {msg} ({elapsed_precise:.dim})")
         .unwrap()
-        .tick_strings(&finito),
+        .tick_chars(SPIN_CHARS),
     );
     pb.set_message(msg);
     pb
@@ -146,12 +148,13 @@ impl Ui {
     } else {
       self.mp.add(ProgressBar::new(len))
     };
+    pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(
       ProgressStyle::with_template(&format!(
         "{{spinner:.green}} {{msg}} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {suffix}"
       ))
       .unwrap()
-      .progress_chars("=> "),
+      .progress_chars("=> ").tick_chars(SPIN_CHARS),
     );
     pb.set_message(msg.into());
     pb
@@ -174,7 +177,8 @@ impl Ui {
         "{{spinner:.green}} {{msg}} [{{bar:38.cyan/blue}}] {{pos}}/{{len}} {suffix}"
       ))
       .unwrap()
-      .progress_chars("=> "),
+      .progress_chars("=> ")
+      .tick_chars(SPIN_CHARS),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_message(format!("{:<width$}", format!("Fetching {name}")));

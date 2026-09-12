@@ -21,6 +21,7 @@
 use super::{
   build::{self, BuildCtx},
   dep_cache::DepCache,
+  diag::ReadPath,
   fingerprint, git, link, lock,
   proj_parse::{
     BuildSystem, Dependency, Flags, Linkage, Profile, Project, ProjectType,
@@ -112,7 +113,7 @@ fn is_shared(name: &str) -> bool {
 }
 
 fn is_static(name: &str) -> bool {
-  if cfg!(target_os = "windows") {
+  if cfg!(target_env = "msvc") {
     name.ends_with(".lib")
   } else {
     name.ends_with(".a")
@@ -125,7 +126,10 @@ fn collect_libs(
   shared: &mut Option<PathBuf>,
   statik: &mut Option<PathBuf>,
 ) -> Result<()> {
-  for entry in fs::read_dir(dir).into_diagnostic()? {
+  for entry in fs::read_dir(dir).map_err(|source| ReadPath {
+    path: dir.to_path_buf(),
+    source,
+  })? {
     let p = entry.into_diagnostic()?.path();
     if p.is_dir() {
       collect_libs(&p, shared, statik)?;
@@ -520,22 +524,30 @@ pub fn local_dep_fingerprint(
   dep: &Dependency,
   cache: &mut fingerprint::FileCache,
 ) -> Result<String> {
-  let dep_dir = parent_dir.join(dep.local.as_ref().expect("local dep"));
+  let dep_dir = parent_dir.join(dep.local.as_ref().expect("Local dep"));
   let kdl = dep_dir.join("conjure.kdl");
+
+  if !matches!(dep_build_system(dep, &dep_dir), BuildSystem::Conjure(_)) {
+    return fingerprint::dir_fingerprint(&dep_dir, cache);
+  }
+
   let child = if kdl.is_file() {
     Project::from_file(&kdl)?
   } else {
     manifestless_project(parent, dep, name, parent_dir)?
   };
+
   let child_profile = child
     .profiles
     .as_ref()
     .and_then(|m| m.get(profile_name))
     .map(|p| (profile_name, p));
+
   let out_profile = child_profile.map_or("default", |(n, _)| n);
   let lock = lock::LockFile::load(dep_dir.join("conjure.lock"))?;
   let commits: Vec<&str> =
     lock.entries().values().map(|e| e.commit.as_str()).collect();
+
   fingerprint::fingerprint(
     &child.with_profile(child_profile.map(|(_, p)| p)),
     &dep_dir,
@@ -909,8 +921,13 @@ pub fn resolve_pkg_config(
 
 #[cfg(test)]
 mod tests {
-  use super::{cache_home, dep_build_system, scope_dir, scope_of};
-  use crate::conjure::proj_parse::{BuildSystem, Dependency};
+  use super::{
+    cache_home, dep_build_system, find_lib, is_shared, is_static,
+    manifestless_project, scope_dir, scope_of, split_cflags_and_libs,
+  };
+  use crate::conjure::proj_parse::{
+    BuildSystem, Compile, Dependency, Flags, Language, Project, ProjectType,
+  };
   use std::path::Path;
 
   #[test]
@@ -990,5 +1007,126 @@ mod tests {
 
     assert_eq!(dep_build_system(&dep, &dir), BuildSystem::Conjure(None));
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  fn dep(local: &str) -> Dependency {
+    Dependency {
+      local: Some(local.into()),
+      build: None,
+      remote: None,
+      transport: None,
+      include: None,
+      src: None,
+      pkg_config: None,
+      r#ref: None,
+    }
+  }
+
+  #[test]
+  fn lib_name_classification() {
+    #[cfg(target_os = "linux")]
+    {
+      assert!(is_shared("libx.so"));
+      assert!(is_shared("libx.so.1"));
+      assert!(!is_shared("libx.a"));
+      assert!(!is_static("libx.so"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+      assert!(is_shared("libx.dylib"));
+      assert!(!is_shared("libx.a"));
+    }
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+      assert!(is_shared("x.dll"));
+      assert!(is_static("x.lib"));
+      assert!(!is_shared("x.lib"));
+      assert!(!is_static("x.dll"));
+    }
+    #[cfg(all(windows, target_env = "gnu"))]
+    {
+      assert!(is_shared("x.dll"));
+      assert!(is_static("libx.a"));
+      assert!(!is_shared("libx.a"));
+      assert!(!is_static("x.dll"));
+    }
+    assert!(!is_static("notes.txt"));
+  }
+
+  #[test]
+  fn pkg_config_output_split() {
+    let (cflags, libs) =
+      split_cflags_and_libs("-I/inc -O2 -L/lib -lz -Wl,-rpath,/x -pthread");
+    assert_eq!(cflags, vec!["-I/inc", "-O2"]);
+    assert_eq!(libs, vec!["-L/lib", "-lz", "-Wl,-rpath,/x", "-pthread"]);
+  }
+
+  #[test]
+  fn find_lib_handles_missing_and_static() {
+    let dir =
+      std::env::temp_dir().join(format!("conjure_lib_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let shared = match () {
+      _ if cfg!(windows) => "x.dll",
+      _ if cfg!(target_os = "macos") => "libx.dylib",
+      _ => "libx.so",
+    };
+    let statik = if cfg!(all(windows, target_env = "msvc")) {
+      "x.lib"
+    } else {
+      "libx.a"
+    };
+
+    assert!(find_lib(&dir, false).is_err());
+
+    std::fs::write(dir.join(shared), "").unwrap();
+    assert_eq!(find_lib(&dir, false).unwrap(), dir.join(shared));
+    assert!(find_lib(&dir, true).is_err());
+
+    std::fs::write(dir.join(statik), "").unwrap();
+    assert_eq!(find_lib(&dir, true).unwrap(), dir.join(statik));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+  #[test]
+  fn manifestless_inherits_parent_and_overrides_src() {
+    let parent = Project {
+      name: "p".into(),
+      language: Language::C,
+      compile: Some(Compile {
+        cc: Some("gcc".into()),
+        standard: Some("c11".into()),
+        include: Some(Flags::Append(vec!["inc".into()])),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+
+    let mut d = dep("../d");
+    d.src = Some(vec!["source".into()]);
+    d.include = Some(vec!["dinc".into()]);
+    let child =
+      manifestless_project(&parent, &d, "d", Path::new("/p")).unwrap();
+
+    assert_eq!(child.ty, ProjectType::Library);
+    assert_eq!(child.language, Language::C);
+    let compile = child.compile.as_ref().unwrap();
+    assert_eq!(compile.src_roots(), vec!["source"]); // dep.src wins
+    assert_eq!(compile.standard.as_deref(), Some("c11")); // inherited
+    let inc = compile.include.as_ref().unwrap().list();
+    let expected_parent = Path::new("/p").join("inc").display().to_string();
+    assert!(inc.contains(&expected_parent.to_string())); // parent include rooted
+    assert!(inc.contains(&"dinc".to_string())); // dep include verbatim
+    assert!(!child.want_static()); // follows the parent's dynamic default
+
+    // No dep.src -> parent's src roots; no dep.include -> no include section.
+    let bare =
+      manifestless_project(&parent, &dep("../d"), "d", Path::new("/p"))
+        .unwrap();
+    let compile = bare.compile.as_ref().unwrap();
+    assert_eq!(compile.src_roots(), vec!["src"]);
+    assert!(compile.include.is_some()); // parent's include still carried
   }
 }

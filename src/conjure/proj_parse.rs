@@ -18,7 +18,7 @@ use std::{collections::HashMap, fs, path::Path, string::String};
 
 /***********************************************************************/
 
-#[derive(Deserialize, Default, Clone, Debug)]
+#[derive(Deserialize, Default, Clone, Debug, Eq, PartialEq)]
 #[serde(try_from = "String")]
 pub enum Language {
   #[default]

@@ -3,6 +3,7 @@ pub(crate) mod cli;
 pub(crate) mod compile;
 pub(crate) mod dep_cache;
 pub(crate) mod deps;
+pub(crate) mod diag;
 pub(crate) mod fingerprint;
 pub(crate) mod git;
 pub(crate) mod link;

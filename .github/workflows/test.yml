@@ -1,0 +1,92 @@
+# Run the unit + integration suite on every OS/target the release matrix ships,
+# so cross-platform code is actually exercised. Windows matters most: the msvc
+# driver, vswhere/vcvars env capture, link.exe, and .exe/.dll/.lib naming are
+# unreachable from the Linux dev box. The MSYS2 leg covers windows-gnu.
+#
+# The integration tests (`tests/cli.rs`) spawn `conjure`, which spawns the
+# toolchain, so each leg needs a working compiler and the same per-OS
+# dependencies the release build uses.
+name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            msys: true
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            openssl_dir: /usr/local/opt/openssl@3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            openssl_dir: /opt/homebrew/opt/openssl@3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # git2 pulls libgit2 + libssh2 (vendored by their -sys crates) and openssl
+      # (from the system). zlib is for the pkg_config integration test.
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config zlib1g-dev
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: Configure OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_DIR=${{ matrix.openssl_dir }}" >> "$GITHUB_ENV"
+
+      - name: Install deps (Windows MSVC)
+        if: runner.os == 'Windows' && !matrix.msys
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md-release
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "VCPKGRS_TRIPLET=x64-windows-static-md-release" >> $env:GITHUB_ENV
+          "VCPKGRS_NO_LIBSSH2=1" >> $env:GITHUB_ENV
+
+      - uses: msys2/setup-msys2@v2
+        if: matrix.msys
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkgconf
+
+      - name: Test
+        if: ${{ !matrix.msys }}
+        env:
+          OPENSSL_DIR: ${{ matrix.openssl_dir }}
+        run: cargo test --locked
+
+      - name: Test (MSYS2)
+        if: matrix.msys
+        shell: msys2 {0}
+        env:
+          OPENSSL_DIR: /mingw64
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
+          rustup target add "${{ matrix.target }}"
+          cargo test --locked --target "${{ matrix.target }}"

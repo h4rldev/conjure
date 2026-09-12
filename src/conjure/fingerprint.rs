@@ -20,9 +20,10 @@
 use super::{
   compile::{C_SRCS, CPP_SRCS, collect_sources, find_sources},
   deps::local_dep_fingerprint,
+  diag::ReadPath,
   proj_parse::{Dependency, Language, Project},
 };
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::HashMap,
@@ -85,7 +86,10 @@ fn mtime_nanos(md: &fs::Metadata) -> i64 {
 /// Content hash of a file. `DefaultHasher` is fixed-key (not randomized), so the
 /// hash is stable across runs; it detects change, it is not a security hash.
 fn hash_file(path: &Path) -> Result<u64> {
-  let bytes = fs::read(path).into_diagnostic()?;
+  let bytes = fs::read(path).map_err(|source| ReadPath {
+    path: path.to_path_buf(),
+    source,
+  })?;
   let mut h = DefaultHasher::new();
   bytes.hash(&mut h);
   Ok(h.finish())
@@ -100,7 +104,11 @@ fn file_fingerprint(
 ) -> Result<Vec<String>> {
   let mut out = Vec::with_capacity(paths.len());
   for path in paths {
-    let md = fs::metadata(path).into_diagnostic()?;
+    let md = fs::metadata(path).map_err(|source| ReadPath {
+      path: path.to_path_buf(),
+      source,
+    })?;
+
     let size = md.len();
     let mtime = mtime_nanos(&md);
 
@@ -118,6 +126,15 @@ fn file_fingerprint(
   }
   out.sort();
   Ok(out)
+}
+
+/// Content fingerprint of a whole directory tree, for a dep whose external
+/// build system consumes the tree rather than a declared `src` set. It includes
+/// generated artifacts, so it is a coarse key and can churn once after the first
+/// build; a conjure dep uses its `src` set instead.
+pub fn dir_fingerprint(dir: &Path, cache: &mut FileCache) -> Result<String> {
+  let files = collect_sources(dir, &[".".to_string()], &[])?;
+  Ok(file_fingerprint(cache, &files)?.join(","))
 }
 
 /// The fingerprint of `project` built in `dir` under `profile_name`, with the
@@ -210,7 +227,9 @@ pub fn fingerprint(
 #[cfg(test)]
 mod tests {
   use super::{FileCache, fingerprint};
-  use crate::conjure::proj_parse::{Dependency, Flags, Language, Project};
+  use crate::conjure::proj_parse::{
+    Arch, Compile, Dependency, Flags, Language, Project,
+  };
   use std::collections::HashMap;
 
   fn local_dep(path: &str) -> Dependency {
@@ -334,6 +353,51 @@ mod tests {
     let third =
       fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
     assert_ne!(first, third);
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn fingerprint_covers_optional_fields() {
+    let base =
+      std::env::temp_dir().join(format!("conjure_fpo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("include")).unwrap();
+    std::fs::write(base.join("src/main.c"), "int main(void){return 0;}")
+      .unwrap();
+    std::fs::write(base.join("include/x.h"), "#pragma once").unwrap();
+
+    let compile = Compile {
+      cc: Some("cc".into()),
+      linker: Some("gcc".into()),
+      standard: Some("c11".into()),
+      arch: Some(Arch::X86_64),
+      include: Some(Flags::Append(vec!["include".into()])),
+      c_flags: Some(Flags::Append(vec!["-Wall".into()])),
+      ld_flags: Some(Flags::Append(vec!["-flto".into()])),
+      ..Default::default()
+    };
+    let full = Project {
+      name: "x".into(),
+      language: Language::C,
+      compile: Some(compile),
+      ..Default::default()
+    };
+    let fp =
+      fingerprint(&full, &base, "default", &[], &mut FileCache::default())
+        .unwrap();
+    assert!(!fp.is_empty());
+
+    // The all-None shape takes the other side of every `if let Some`.
+    let bare = Project {
+      name: "x".into(),
+      language: Language::C,
+      compile: Some(Compile::default()),
+      ..Default::default()
+    };
+    fingerprint(&bare, &base, "default", &[], &mut FileCache::default())
+      .unwrap();
 
     let _ = std::fs::remove_dir_all(&base);
   }

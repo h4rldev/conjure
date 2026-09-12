@@ -19,7 +19,7 @@
 
     eachSystem = nixpkgs.lib.genAttrs systems;
 
-    cargo = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+    cargo = fromTOML (builtins.readFile ./Cargo.toml);
     version = cargo.package.version;
 
     mkConjure = pkgs: buildType:
@@ -53,6 +53,8 @@
           pkg-config
           openssl
           cmake
+
+          cargo-llvm-cov
 
           ### For the test project.
           mold
