@@ -534,7 +534,6 @@ fn build_conjure_dep<'a>(
     manifestless_project(ctx.parent, dep, name, ctx.dir)?
   };
 
-  let profile_name = ctx.profile.map_or("default", |(n, _)| n);
   let child_profile = ctx.profile.and_then(|(n, _)| {
     child
       .profiles
@@ -542,6 +541,7 @@ fn build_conjure_dep<'a>(
       .and_then(|m| m.get(n))
       .map(|p| (n, p))
   });
+
   let effective = child.with_profile(child_profile.map(|(_, p)| p));
 
   miette::ensure!(
@@ -567,7 +567,8 @@ fn build_conjure_dep<'a>(
     force: false,
   };
   build::build_ctx(&child_ctx)?;
-  Ok(link::library_path(&effective, ctx.root, profile_name, true))
+  let out_profile = child_profile.map_or("default", |(n, _)| n);
+  Ok(link::library_path(&effective, ctx.root, out_profile, true))
 }
 
 /// One dependency's resolved work item for a build.

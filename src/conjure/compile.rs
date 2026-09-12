@@ -62,6 +62,25 @@ pub fn find_sources(
   Ok(())
 }
 
+/// Expand a project's configured source roots into files: recurse directories,
+/// and take an exact-file root as named (no extension filter).
+fn collect_sources(
+  root: &Path,
+  roots: &[String],
+  exts: &[&str],
+) -> Result<Vec<PathBuf>> {
+  let mut sources = vec![];
+  for root_dir in roots {
+    let path = root.join(root_dir);
+    if path.is_file() {
+      sources.push(path);
+    } else {
+      find_sources(&path, exts, &mut sources)?;
+    }
+  }
+  Ok(sources)
+}
+
 /// Build the compile invocation for every source in `project`.
 ///
 /// `root` is the project dir (sources, object paths, and `compile_commands`
@@ -86,10 +105,7 @@ pub fn compile_entries(
   };
 
   let roots = compile.src_roots();
-  let mut sources = vec![];
-  for root_dir in &roots {
-    find_sources(&root.join(root_dir), exts, &mut sources)?;
-  }
+  let sources = collect_sources(root, &roots, exts)?;
 
   miette::ensure!(
     !sources.is_empty(),
@@ -259,6 +275,29 @@ mod tests {
     find_sources(&dir, C_SRCS, &mut out).unwrap();
     assert_eq!(out.len(), 1);
     assert!(out[0].ends_with("a.c"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn collect_sources_accepts_file_roots() {
+    let dir =
+      std::env::temp_dir().join(format!("conjure_cs_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.c"), "").unwrap();
+    std::fs::write(dir.join("b.c"), "").unwrap();
+
+    // An exact file root is taken as-is, not recursed or filtered.
+    assert_eq!(
+      collect_sources(&dir, &["a.c".into()], C_SRCS).unwrap(),
+      vec![dir.join("a.c")]
+    );
+
+    // A directory root still recurses.
+    assert_eq!(
+      collect_sources(&dir, &[".".into()], C_SRCS).unwrap().len(),
+      2
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
   }
