@@ -703,7 +703,7 @@ fn sibling_profiles_resolve_independently() {
   // root: ROOT set, SIB not
   write(
     &dir.join("src").join("main.c"),
-    "#ifndef ROOT\n#error root missing ROOT\n#endif\n#ifdef SIB\n#error root leaked SIB\n#endif\nint main(void){return 0;}\n",
+    "#ifndef ROOT\n#error Root missing ROOT\n#endif\n#ifdef SIB\n#error root leaked SIB\n#endif\nint main(void){return 0;}\n",
   );
   write(
     &dir.join("sib").join("conjure.kdl"),
@@ -720,7 +720,7 @@ fn sibling_profiles_resolve_independently() {
   // sib: SIB set, ROOT not
   write(
     &dir.join("sib").join("src").join("main.c"),
-    "#ifndef SIB\n#error sib missing SIB\n#endif\n#ifdef ROOT\n#error sib leaked ROOT\n#endif\nint main(void){return 0;}\n",
+    "#ifndef SIB\n#error Sib missing SIB\n#endif\n#ifdef ROOT\n#error Sib leaked ROOT\n#endif\nint main(void){return 0;}\n",
   );
 
   conjure(&dir, &["build", "-p", "dev"]);
@@ -765,7 +765,7 @@ fn sibling_without_profile_builds_default() {
   // sibling has no `dev`, so it must build default and must NOT see ROOT
   write(
     &dir.join("sib").join("src").join("main.c"),
-    "#ifdef ROOT\n#error sibling inherited ROOT\n#endif\nint main(void){return 0;}\n",
+    "#ifdef ROOT\n#error Sibling inherited ROOT\n#endif\nint main(void){return 0;}\n",
   );
 
   let out = conjure(&dir, &["build", "-p", "dev"]);
@@ -877,19 +877,19 @@ fn compile_commands_include_siblings() {
   );
   write(&dir.join("sib/src/main.c"), MAIN_C);
 
-  let sib_src = dir.join("sib").join("src").join("main.c");
+  let sib_src = Path::new("sib").join("src").join("main.c");
   let sib_src = sib_src.display().to_string();
 
   conjure(&dir, &["compile-commands"]);
   let json = fs::read_to_string(dir.join("compile_commands.json")).unwrap();
   assert!(json.contains("main.c"));
-  assert!(json.contains(&sib_src), "sibling sources missing: {json}");
+  assert!(json.contains(&sib_src), "Sibling sources missing: {json}");
 
   conjure(&dir, &["compile-commands", "--no-siblings"]);
   let json = fs::read_to_string(dir.join("compile_commands.json")).unwrap();
   assert!(
     !json.contains(&sib_src),
-    "unexpected sibling entries: {json}"
+    "Unexpected sibling entries: {json}"
   );
 }
 
