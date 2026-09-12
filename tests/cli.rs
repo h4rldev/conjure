@@ -877,16 +877,24 @@ fn compile_commands_include_siblings() {
   );
   write(&dir.join("sib/src/main.c"), MAIN_C);
 
-  let sib_src = Path::new("sib").join("src").join("main.c");
-  let sib_src = sib_src.display().to_string();
+  let norm = |s: &str| s.replace("\\\\", "/").replace('\\', "/");
+  let sib_src = norm(
+    &Path::new("sib")
+      .join("src")
+      .join("main.c")
+      .display()
+      .to_string(),
+  );
 
   conjure(&dir, &["compile-commands"]);
-  let json = fs::read_to_string(dir.join("compile_commands.json")).unwrap();
+  let json =
+    norm(&fs::read_to_string(dir.join("compile_commands.json")).unwrap());
   assert!(json.contains("main.c"));
   assert!(json.contains(&sib_src), "Sibling sources missing: {json}");
 
   conjure(&dir, &["compile-commands", "--no-siblings"]);
-  let json = fs::read_to_string(dir.join("compile_commands.json")).unwrap();
+  let json =
+    norm(&fs::read_to_string(dir.join("compile_commands.json")).unwrap());
   assert!(
     !json.contains(&sib_src),
     "Unexpected sibling entries: {json}"
