@@ -24,8 +24,8 @@ use super::{
   diag::ReadPath,
   fingerprint, git, link, lock,
   proj_parse::{
-    BuildSystem, Dependency, Flags, Linkage, Profile, Project, ProjectType,
-    Remote, Transport,
+    BuildSystem, Dependency, Flags, Linkage, Project, ProjectType, Remote,
+    Transport,
   },
   ui::{StepStatus, Ui},
 };
@@ -466,7 +466,7 @@ pub struct ConjureCtx<'a> {
   pub parent: &'a Project,
   pub dir: &'a Path,  // parent project dir
   pub root: &'a Path, // invocation root
-  pub profile: Option<(&'a str, &'a Profile)>,
+  pub profile: Option<&'a str>,
 }
 
 /// Synthesize a manifestless dep project: the parent's compile settings
@@ -577,23 +577,7 @@ fn build_conjure_dep<'a>(
     manifestless_project(ctx.parent, dep, name, ctx.dir)?
   };
 
-  let child_profile = ctx.profile.and_then(|(n, _)| {
-    child
-      .profiles
-      .as_ref()
-      .and_then(|m| m.get(n))
-      .map(|p| (n, p))
-  });
-
-  if let Some((n, _)) = ctx.profile
-    && child_profile.is_none()
-  {
-    ui.println(
-      Some(&StepStatus::Info),
-      format!("{name}: no `{n}` profile; building default"),
-    )?;
-  }
-
+  let child_profile = ctx.profile.and_then(|name| child.profile(name));
   let effective = child.with_profile(child_profile.map(|(_, p)| p));
 
   miette::ensure!(
@@ -611,14 +595,16 @@ fn build_conjure_dep<'a>(
     Some(&StepStatus::Info),
     format!("Building {} with conjure", name),
   )?;
+
   let child_ctx = BuildCtx {
     project: &child,
     dir: dep_dir.to_path_buf(),
     root: ctx.root.to_path_buf(),
-    profile: child_profile,
+    profile: ctx.profile, // build_ctx resolves + prints the fallback note
     force: false,
   };
-  build::build_ctx(&child_ctx)?;
+
+  build::build_ctx(&child_ctx, ui)?;
   let out_profile = child_profile.map_or("default", |(n, _)| n);
   Ok(link::library_path(&effective, ctx.root, out_profile, true))
 }
@@ -684,7 +670,7 @@ pub fn build_deps(
   proj: &Project,
   dir: &Path,
   root: &Path,
-  profile: Option<(&str, &Profile)>,
+  profile: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
   let deps = match &proj.dependencies {
     Some(d) if !d.is_empty() => d,
@@ -771,7 +757,7 @@ pub fn build_deps(
     let work = match &dep.local {
       Some(p) => {
         let dep_dir = dir.join(p);
-        let profile_name = profile.map_or("default", |(n, _)| n);
+        let profile_name = profile.unwrap_or("default");
         let key = format!(
           "{}:{key_tag}",
           local_dep_fingerprint(

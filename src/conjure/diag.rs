@@ -25,3 +25,12 @@ pub struct ReadPath {
   #[source]
   pub source: std::io::Error,
 }
+
+#[derive(Debug, thiserror::Error, Diagnostic)]
+#[error("Failed to write `{}`", .path.display())]
+#[diagnostic(help("Likely a permissions issue"))]
+pub struct WritePath {
+  pub path: PathBuf,
+  #[source]
+  pub source: std::io::Error,
+}

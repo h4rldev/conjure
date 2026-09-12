@@ -245,12 +245,16 @@ struct BuildArgs {
   /// Force a build even if nothing has changed
   #[arg(long, short = 'f')]
   force: bool,
+  #[arg(long, short = 's')]
+  no_siblings: bool,
 }
 
 #[derive(Args)]
 struct CompileCommandsArgs {
   #[arg(long, short = 'p')]
   profile: Option<String>,
+  #[arg(long, short = 's')]
+  no_siblings: bool,
 }
 
 #[derive(Args)]
@@ -940,50 +944,42 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
 
 fn handle_build(args: &BuildArgs) -> Result<()> {
   let project = Project::from_file("conjure.kdl")?;
-  let profile_name = args
+  let profile = args
     .profile
     .clone()
     .or_else(|| std::env::var("CONJURE_PROFILE").ok());
-  let profile = match profile_name.as_deref() {
-    Some(name) => {
-      let profiles = project
+  if let Some(name) = profile.as_deref() {
+    miette::ensure!(
+      project
         .profiles
         .as_ref()
-        .ok_or_else(|| miette::miette!("no profiles in conjure.kdl"))?;
-      let p = profiles
-        .get(name)
-        .ok_or_else(|| miette::miette!("profile `{name}` not found"))?;
-      Some((name, p))
-    }
-    None => None,
-  };
+        .is_some_and(|m| m.contains_key(name)),
+      "profile `{name}` not found"
+    );
+  }
 
-  build::build(&project, profile, args.force)
+  build::build(&project, profile.as_deref(), args.force, !args.no_siblings)
 }
 
 fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
   let project = Project::from_file("conjure.kdl")?;
   let ui = Ui::new();
 
-  let profile_name = args
+  let profile = args
     .profile
     .clone()
     .or_else(|| std::env::var("CONJURE_PROFILE").ok());
-  let profile = match profile_name.as_deref() {
-    Some(name) => {
-      let profiles = project
+  if let Some(name) = profile.as_deref() {
+    miette::ensure!(
+      project
         .profiles
         .as_ref()
-        .ok_or_else(|| miette::miette!("no profiles in conjure.kdl"))?;
-      let p = profiles
-        .get(name)
-        .ok_or_else(|| miette::miette!("profile `{name}` not found"))?;
-      Some((name, p))
-    }
-    None => None,
-  };
+        .is_some_and(|m| m.contains_key(name)),
+      "profile `{name}` not found"
+    );
+  }
 
-  compile::compile_commands(&project, profile)?;
+  compile::compile_commands(&project, profile.as_deref(), !args.no_siblings)?;
   ui.println(
     Some(&StepStatus::Success),
     "Generated compile_commands.json",

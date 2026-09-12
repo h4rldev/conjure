@@ -566,6 +566,19 @@ impl Project {
     matches!(self.ty, ProjectType::Library)
   }
 
+  /// `name` resolved against this project's own profiles, or `None` when it
+  /// doesn't define one (the build falls back to default).
+  pub fn profile<'a>(
+    &'a self,
+    name: &'a str,
+  ) -> Option<(&'a str, &'a Profile)> {
+    self
+      .profiles
+      .as_ref()
+      .and_then(|m| m.get(name))
+      .map(|p| (name, p))
+  }
+
   /// The effective project for a build: `Some(profile)` folds its overrides over
   /// the base; `None` returns a clone unchanged.
   pub fn with_profile(&self, profile: Option<&Profile>) -> Project {

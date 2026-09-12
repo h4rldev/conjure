@@ -13,8 +13,8 @@
 
 use super::{
   deps::dep_include_dirs,
-  diag::ReadDir,
-  proj_parse::{Flags, Language, Profile, Project},
+  diag::{ReadDir, WritePath},
+  proj_parse::{Flags, Language, Project},
   toolchain,
   ui::{StepStatus, Ui, mark},
 };
@@ -244,21 +244,42 @@ pub fn compile(
 /// so the database matches a real profile build.
 pub fn compile_commands(
   project: &Project,
-  profile: Option<(&str, &Profile)>,
+  profile: Option<&str>,
+  siblings: bool,
 ) -> Result<()> {
   let root = std::env::current_dir().into_diagnostic()?;
-  let profile_name = profile.map_or("default", |(name, _)| name);
-  let project = project.with_profile(profile.map(|(_, p)| p));
-  let entries: Vec<_> =
-    compile_entries(&root, &root, &project, profile_name, vec![])?
-      .into_iter()
-      .map(|(_, e)| e)
-      .collect();
+
+  let mut targets: Vec<(Project, PathBuf)> =
+    vec![(project.clone(), root.clone())];
+  if siblings && let Some(map) = &project.siblings {
+    let mut sibs: Vec<_> = map.iter().collect();
+    sibs.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+    for (_, sib) in sibs {
+      let dir = root.join(&sib.path);
+      targets.push((Project::from_file(dir.join("conjure.kdl"))?, dir));
+    }
+  }
+
+  let mut entries = vec![];
+  for (proj, dir) in targets {
+    let resolved = profile.and_then(|name| proj.profile(name));
+    let name = resolved.map_or("default", |(n, _)| n);
+    let effective = proj.with_profile(resolved.map(|(_, p)| p));
+    entries.extend(
+      compile_entries(&dir, &root, &effective, name, vec![])?
+        .into_iter()
+        .map(|(_, e)| e),
+    );
+  }
+
   fs::write(
     "compile_commands.json",
     serde_json::to_string_pretty(&entries).into_diagnostic()?,
   )
-  .into_diagnostic()?;
+  .map_err(|source| WritePath {
+    path: "compile_commands.json".into(),
+    source,
+  })?;
 
   Ok(())
 }

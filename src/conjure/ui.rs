@@ -10,7 +10,7 @@
 //! [`Ui::println`] suspends the bars and writes straight to stderr on purpose:
 //! indicatif only flushes its own `println` lines while a bar is actively
 //! drawing, so a status printed from a quiet phase - or after the last bar has
-//! finished - would be silently dropped.use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+//! finished - would be silently dropped.
 
 /***********************************************************************/
 

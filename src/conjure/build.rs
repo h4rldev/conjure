@@ -33,14 +33,21 @@ pub struct BuildCtx<'a> {
   pub project: &'a Project,
   pub dir: PathBuf,
   pub root: PathBuf,
-  pub profile: Option<(&'a str, &'a Profile)>,
+  /// Selected profile *name*; resolved against `project`'s own profiles. A name
+  /// the project does not define falls back to default (see `build_ctx`).
+  pub profile: Option<&'a str>,
   pub force: bool,
 }
 
 impl<'a> BuildCtx<'a> {
-  /// The active profile's name, or `"default"` when none is selected.
+  /// The named profile if this project defines it, else `None` (default build).
+  fn resolve(&self) -> Option<(&'a str, &'a Profile)> {
+    self.profile.and_then(|name| self.project.profile(name))
+  }
+
+  /// The profile actually built: the named one if defined, else `"default"`.
   pub fn profile_name(&self) -> &str {
-    self.profile.map_or("default", |(name, _)| name)
+    self.resolve().map_or("default", |(name, _)| name)
   }
 }
 
@@ -62,10 +69,20 @@ fn built_artifact(
 
 /// Build one project: skip if current, else build deps, compile, link, and
 /// record the fingerprint.
-pub fn build_ctx(ctx: &BuildCtx) -> Result<()> {
-  let ui = Ui::new();
+pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
+  if let Some(name) = ctx.profile
+    && ctx.resolve().is_none()
+  {
+    ui.println(
+      Some(&StepStatus::Info),
+      format!(
+        "{}: no `{name}` profile; building default",
+        ctx.project.name
+      ),
+    )?;
+  }
   let profile_name = ctx.profile_name();
-  let project = ctx.project.with_profile(ctx.profile.map(|(_, p)| p));
+  let project = ctx.project.with_profile(ctx.resolve().map(|(_, p)| p));
 
   let lock = lock::LockFile::load(ctx.dir.join("conjure.lock"))?;
   let dep_commits: Vec<String> =
@@ -93,7 +110,7 @@ pub fn build_ctx(ctx: &BuildCtx) -> Result<()> {
   }
 
   let dep_libs =
-    deps::build_deps(&ui, &project, &ctx.dir, &ctx.root, ctx.profile)?;
+    deps::build_deps(ui, &project, &ctx.dir, &ctx.root, ctx.profile)?;
 
   let (pkg_cflags, pkg_libs) =
     deps::resolve_pkg_config(&project, &ctx.dir, &ctx.root)?;
@@ -125,7 +142,7 @@ pub fn build_ctx(ctx: &BuildCtx) -> Result<()> {
   });
 
   let build_env = toolchain::resolve(compile, &project.language).env();
-  compile::compile(&ui, &ctx.dir, entries, threads, build_env)?;
+  compile::compile(ui, &ctx.dir, entries, threads, build_env)?;
 
   let inputs = link::LinkInputs {
     objects: &objects,
@@ -135,7 +152,7 @@ pub fn build_ctx(ctx: &BuildCtx) -> Result<()> {
     compile,
   };
 
-  link::produce(&ui, &project, &ctx.dir, &ctx.root, profile_name, &inputs)?;
+  link::produce(ui, &project, &ctx.dir, &ctx.root, profile_name, &inputs)?;
 
   let _ = fs::create_dir_all(state_file.parent().unwrap());
   let _ = fs::write(state_file, fp);
@@ -145,32 +162,45 @@ pub fn build_ctx(ctx: &BuildCtx) -> Result<()> {
 /// Build a project and all of its siblings under the current directory.
 pub fn build(
   project: &Project,
-  profile: Option<(&str, &Profile)>,
+  profile: Option<&str>,
   force: bool,
+  siblings: bool,
 ) -> Result<()> {
   let cwd = std::env::current_dir().into_diagnostic()?;
-  let ctx = BuildCtx {
-    project,
-    dir: cwd.clone(),
-    root: cwd.clone(),
-    profile,
-    force,
-  };
-  build_ctx(&ctx)?;
+  let ui = Ui::new();
+  build_ctx(
+    &BuildCtx {
+      project,
+      dir: cwd.clone(),
+      root: cwd.clone(),
+      profile,
+      force,
+    },
+    &ui,
+  )?;
 
-  if let Some(siblings) = &project.siblings {
-    for sib in siblings.values() {
+  if !siblings {
+    return Ok(());
+  }
+
+  if let Some(map) = &project.siblings {
+    // HashMap iteration is nondeterministic; sort so multi-sibling runs are.
+    let mut sibs: Vec<_> = map.iter().collect();
+    sibs.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+    for (_, sib) in sibs {
       let sib_dir = cwd.join(&sib.path);
       let sib_project =
         proj_parse::Project::from_file(sib_dir.join("conjure.kdl"))?;
-      let sib_ctx = BuildCtx {
-        project: &sib_project,
-        dir: sib_dir,
-        root: cwd.clone(),
-        profile,
-        force,
-      };
-      build_ctx(&sib_ctx)?;
+      build_ctx(
+        &BuildCtx {
+          project: &sib_project,
+          dir: sib_dir,
+          root: cwd.clone(),
+          profile, // same *name*; build_ctx resolves it per sibling
+          force,
+        },
+        &ui,
+      )?;
     }
   }
   Ok(())
