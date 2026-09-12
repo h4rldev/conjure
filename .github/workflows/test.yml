@@ -76,8 +76,6 @@ jobs:
 
       - name: Test
         if: ${{ !matrix.msys }}
-        env:
-          OPENSSL_DIR: ${{ matrix.openssl_dir }}
         run: cargo test --locked
 
       - name: Test (MSYS2)
