@@ -542,6 +542,15 @@ fn build_conjure_dep<'a>(
       .map(|p| (n, p))
   });
 
+  if let Some((n, _)) = ctx.profile
+    && child_profile.is_none()
+  {
+    ui.println(
+      Some(&StepStatus::Info),
+      format!("{name}: no `{n}` profile; building default"),
+    )?;
+  }
+
   let effective = child.with_profile(child_profile.map(|(_, p)| p));
 
   miette::ensure!(
