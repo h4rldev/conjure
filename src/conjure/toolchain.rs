@@ -785,6 +785,9 @@ mod tests {
   };
   use std::path::PathBuf;
 
+  #[cfg(windows)]
+  use super::default_compiler;
+
   #[test]
   fn words_handles_quotes_and_escapes() {
     assert_eq!(
