@@ -1038,7 +1038,7 @@ mod tests {
     {
       assert!(is_shared("x.dll"));
       assert!(is_static("x.lib"));
-      assert!(!is_shared("x.a")); // GNU archive also valid on msvc
+      assert!(is_static("x.a")); // GNU archive also valid on msvc
       assert!(!is_shared("x.lib"));
       assert!(!is_static("x.dll"));
     }
