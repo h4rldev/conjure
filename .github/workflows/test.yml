@@ -14,6 +14,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
@@ -39,6 +43,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Cargo registry/git + compiled dependencies, keyed per target, so a
+      # repeat run does not rebuild the whole dependency tree.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       # git2 pulls libgit2 + libssh2 (vendored by their -sys crates) and openssl
       # (from the system). zlib is for the pkg_config integration test.
       - name: Install deps (Linux)
@@ -55,10 +65,20 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "OPENSSL_DIR=${{ matrix.openssl_dir }}" >> "$GITHUB_ENV"
 
+      # openssl is the slow vcpkg port; cache its built archive.
+      - name: Cache vcpkg binaries (Windows)
+        if: runner.os == 'Windows' && !matrix.msys
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-x64-windows-static-md-release
+
       - name: Install deps (Windows MSVC)
         if: runner.os == 'Windows' && !matrix.msys
         shell: pwsh
         run: |
+          # GNU make for the external-build-system integration test.
+          choco install make -y --no-progress
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md-release
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           "VCPKGRS_TRIPLET=x64-windows-static-md-release" >> $env:GITHUB_ENV
@@ -70,6 +90,7 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
+            make
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-pkgconf

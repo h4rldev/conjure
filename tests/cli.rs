@@ -469,7 +469,12 @@ fn static_library_root_builds_archive() {
   write(&dir.join("src/greet.c"), "int greet(void) { return 42; }\n");
 
   conjure(&dir, &["build"]);
-  assert!(dir.join("lib/default/libgreet.a").is_file());
+  let archive = if cfg!(target_env = "msvc") {
+    "greet.lib"
+  } else {
+    "libgreet.a"
+  };
+  assert!(dir.join("lib/default").join(archive).is_file());
 }
 
 #[test]
@@ -512,42 +517,8 @@ fn git_remote_dep_clones_locks_and_builds() {
     return;
   }
   let base = tmp("gitdep");
-
-  // upstream: a real git repo holding a conjure library
-  let up = base.join("upstream");
-  write(&up.join("conjure.kdl"), LIB_MANIFEST);
-  write(
-    &up.join("include/greet.h"),
-    "#pragma once\nint greet(void);\n",
-  );
-  write(&up.join("src/greet.c"), "int greet(void) { return 42; }\n");
-  git(&up, &["init", "-q"]);
-  git(&up, &["add", "."]);
-  git(&up, &["commit", "-qm", "init"]);
-
-  // consumer: a generic git remote pointing at the local repo path
-  let app = base.join("app");
-  write(
-    &app.join("conjure.kdl"),
-    &format!(
-      r#"project {{
-  name app
-  language c
-  type binary
-  link dynamic
-  compile {{ standard c11 }}
-  dependencies {{
-    greet {{ remote git "{}" }}
-  }}
-}}
-"#,
-      up.display()
-    ),
-  );
-  write(
-    &app.join("src/main.c"),
-    "#include \"greet.h\"\nint main(void) { return greet() == 42 ? 0 : 1; }\n",
-  );
+  let up = git_upstream(&base);
+  let app = git_consumer(&base, &up);
 
   // build clones + auto-locks the unlocked dep
   conjure(&app, &["build"]);
@@ -563,7 +534,6 @@ fn git_remote_dep_clones_locks_and_builds() {
   conjure(&app, &["lock"]);
   conjure(&app, &["update"]);
 }
-
 #[test]
 fn remote_dep_reuses_cache_on_rebuild() {
   if !have_cc() || !have_git() {

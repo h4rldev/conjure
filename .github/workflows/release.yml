@@ -68,6 +68,22 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
+      # Cargo registry/git + compiled dependencies (the workspace crate itself
+      # is rebuilt), so repeat releases and re-runs do not recompile the whole
+      # tree. Keyed per target.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # vcpkg's binary cache: openssl is the slow port, so a cached archive
+      # skips recompiling it on every release.
+      - name: Cache vcpkg binaries (Windows)
+        if: runner.os == 'Windows' && !matrix.msys
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-x64-windows-static-md-release
+
       # git2 pulls libgit2 + libssh2 (both vendored by their -sys crates) and
       # openssl (from the system, hence the per-OS installs below).
       - name: Install deps (Linux)

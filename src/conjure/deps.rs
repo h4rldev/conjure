@@ -113,11 +113,9 @@ fn is_shared(name: &str) -> bool {
 }
 
 fn is_static(name: &str) -> bool {
-  if cfg!(target_env = "msvc") {
-    name.ends_with(".lib")
-  } else {
-    name.ends_with(".a")
-  }
+  // GNU `ar` archives are `.a` everywhere, including MinGW on Windows; MSVC
+  // additionally uses `.lib`. External build systems may emit either.
+  name.ends_with(".a") || (cfg!(target_env = "msvc") && name.ends_with(".lib"))
 }
 
 /// Record the first shared and first static library found anywhere under `dir`.
@@ -1040,6 +1038,7 @@ mod tests {
     {
       assert!(is_shared("x.dll"));
       assert!(is_static("x.lib"));
+      assert!(!is_shared("x.a")); // GNU archive also valid on msvc
       assert!(!is_shared("x.lib"));
       assert!(!is_static("x.dll"));
     }
