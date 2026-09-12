@@ -18,7 +18,8 @@
 /***********************************************************************/
 
 use super::{
-  compile::{C_SRCS, CPP_SRCS, find_sources},
+  compile::{C_SRCS, CPP_SRCS, collect_sources, find_sources},
+  deps::local_dep_fingerprint,
   proj_parse::{Dependency, Language, Project},
 };
 use miette::{IntoDiagnostic, Result};
@@ -119,15 +120,6 @@ fn file_fingerprint(
   Ok(out)
 }
 
-/// Fingerprint of an entire directory tree, used as a cache key for a local
-/// dependency's sources.
-pub fn dir_key(dir: &Path) -> Result<String> {
-  let mut files = vec![];
-  find_sources(dir, &[], &mut files)?;
-  let mut cache = FileCache::default();
-  Ok(file_fingerprint(&mut cache, &files)?.join(","))
-}
-
 /// The fingerprint of `project` built in `dir` under `profile_name`, with the
 /// given pinned dependency commits. `cache` carries the previous run's file
 /// hashes so unchanged files are not re-read.
@@ -184,10 +176,7 @@ pub fn fingerprint(
   items.extend(dep_commits.iter().map(|s| s.to_string()));
 
   let roots = compile.src_roots();
-  let mut sources = vec![];
-  for root in &roots {
-    find_sources(&dir.join(root), exts, &mut sources)?;
-  }
+  let sources = collect_sources(dir, &roots, exts)?;
   items.extend(file_fingerprint(cache, &sources)?);
 
   if let Some(include) = &compile.include {
@@ -206,12 +195,10 @@ pub fn fingerprint(
         "{name}:cfg:{:?}:{:?}:{:?}:{:?}",
         dep.build, dep.include, dep.pkg_config, dep.src
       ));
-      if let Some(path) = &dep.local {
-        let mut files = vec![];
-        find_sources(&dir.join(path), &[], &mut files)?;
+      if dep.local.is_some() {
         items.push(format!(
           "{name}:{}",
-          file_fingerprint(cache, &files)?.join(",")
+          local_dep_fingerprint(project, dir, profile_name, name, dep, cache)?
         ));
       }
     }
@@ -223,7 +210,7 @@ pub fn fingerprint(
 #[cfg(test)]
 mod tests {
   use super::{FileCache, fingerprint};
-  use crate::conjure::proj_parse::{Dependency, Language, Project};
+  use crate::conjure::proj_parse::{Dependency, Flags, Language, Project};
   use std::collections::HashMap;
 
   fn local_dep(path: &str) -> Dependency {
@@ -245,10 +232,10 @@ mod tests {
       std::env::temp_dir().join(format!("conjure_fp_{}", std::process::id()));
     std::fs::create_dir_all(base.join("src")).unwrap();
     std::fs::write(base.join("src/main.c"), "").unwrap();
-    std::fs::create_dir_all(base.join("deps/a")).unwrap();
-    std::fs::create_dir_all(base.join("deps/b")).unwrap();
-    std::fs::write(base.join("deps/a/a.c"), "").unwrap();
-    std::fs::write(base.join("deps/b/b.c"), "").unwrap();
+    std::fs::create_dir_all(base.join("deps/a/src")).unwrap();
+    std::fs::create_dir_all(base.join("deps/b/src")).unwrap();
+    std::fs::write(base.join("deps/a/src/a.c"), "").unwrap();
+    std::fs::write(base.join("deps/b/src/b.c"), "").unwrap();
 
     let mut a = Project {
       name: "x".into(),
@@ -307,6 +294,43 @@ mod tests {
 
     // Editing the content changes the fingerprint.
     std::fs::write(src.join("main.c"), "int main(void){return 1;}").unwrap();
+    let third =
+      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+    assert_ne!(first, third);
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn fingerprint_includes_single_file_sources() {
+    let base =
+      std::env::temp_dir().join(format!("conjure_fs1_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("a.c"), "int a;").unwrap();
+    std::fs::write(base.join("b.c"), "int b;").unwrap();
+
+    let mut project = Project {
+      name: "x".into(),
+      language: Language::C,
+      compile: Some(Default::default()),
+      ..Default::default()
+    };
+    project.compile.as_mut().unwrap().src =
+      Some(Flags::Append(vec!["a.c".into()]));
+
+    let mut cache = FileCache::default();
+    let first =
+      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+
+    // A file the project doesn't list changes nothing.
+    std::fs::write(base.join("b.c"), "int b = 1;").unwrap();
+    let second =
+      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+    assert_eq!(first, second);
+
+    // Editing the listed file invalidates.
+    std::fs::write(base.join("a.c"), "int a = 1;").unwrap();
     let third =
       fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
     assert_ne!(first, third);

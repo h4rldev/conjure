@@ -67,7 +67,7 @@ fn scope_of(root: &Path, dir: &Path) -> String {
 
 /// A dependency's source dir: local deps are relative to the project dir,
 /// remote deps live under the scope's cache dir.
-fn dep_dir(
+pub fn dep_dir(
   name: &str,
   dep: &Dependency,
   dir: &Path,
@@ -470,7 +470,7 @@ pub struct ConjureCtx<'a> {
 /// Synthesize a manifestless dep project: the parent's compile settings
 /// inherited, with `src` from `dep.src` (or the parent's roots) and includes
 /// absolutized against the parent dir plus the dep's own includes.
-fn manifestless_project(
+pub fn manifestless_project(
   parent: &Project,
   dep: &Dependency,
   name: &str,
@@ -510,6 +510,39 @@ fn manifestless_project(
     compile: Some(compile),
     ..Default::default()
   })
+}
+
+pub fn local_dep_fingerprint(
+  parent: &Project,
+  parent_dir: &Path,
+  profile_name: &str,
+  name: &str,
+  dep: &Dependency,
+  cache: &mut fingerprint::FileCache,
+) -> Result<String> {
+  let dep_dir = parent_dir.join(dep.local.as_ref().expect("local dep"));
+  let kdl = dep_dir.join("conjure.kdl");
+  let child = if kdl.is_file() {
+    Project::from_file(&kdl)?
+  } else {
+    manifestless_project(parent, dep, name, parent_dir)?
+  };
+  let child_profile = child
+    .profiles
+    .as_ref()
+    .and_then(|m| m.get(profile_name))
+    .map(|p| (profile_name, p));
+  let out_profile = child_profile.map_or("default", |(n, _)| n);
+  let lock = lock::LockFile::load(dep_dir.join("conjure.lock"))?;
+  let commits: Vec<&str> =
+    lock.entries().values().map(|e| e.commit.as_str()).collect();
+  fingerprint::fingerprint(
+    &child.with_profile(child_profile.map(|(_, p)| p)),
+    &dep_dir,
+    out_profile,
+    &commits,
+    cache,
+  )
 }
 
 /// Build a dependency with conjure itself, in-process. Mode A: the dep root
@@ -728,7 +761,18 @@ pub fn build_deps(
     let work = match &dep.local {
       Some(p) => {
         let dep_dir = dir.join(p);
-        let key = format!("{}:{key_tag}", fingerprint::dir_key(&dep_dir)?);
+        let profile_name = profile.map_or("default", |(n, _)| n);
+        let key = format!(
+          "{}:{key_tag}",
+          local_dep_fingerprint(
+            proj,
+            dir,
+            profile_name,
+            name,
+            dep,
+            &mut fingerprint::FileCache::default(),
+          )?
+        );
         match cache.hit(&scope, name, &key) {
           Some(lib) => {
             ui.println(

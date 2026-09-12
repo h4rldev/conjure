@@ -64,7 +64,7 @@ pub fn find_sources(
 
 /// Expand a project's configured source roots into files: recurse directories,
 /// and take an exact-file root as named (no extension filter).
-fn collect_sources(
+pub fn collect_sources(
   root: &Path,
   roots: &[String],
   exts: &[&str],
