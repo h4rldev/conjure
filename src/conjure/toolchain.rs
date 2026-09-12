@@ -1116,7 +1116,7 @@ gcc version 15.3.0\n\
     assert_eq!(tc.obj_ext(), "o");
   }
 
-  #[cfg(windows)]
+  #[cfg(all(windows, target_env = "msvc"))]
   #[test]
   fn msvc_env_is_captured_on_windows() {
     assert!(
@@ -1125,7 +1125,7 @@ gcc version 15.3.0\n\
     );
   }
 
-  #[cfg(windows)]
+  #[cfg(all(windows, target_env = "msvc"))]
   #[test]
   fn default_compiler_is_msvc_when_visual_studio_is_present() {
     assert_eq!(default_compiler(&Language::C), "cl");

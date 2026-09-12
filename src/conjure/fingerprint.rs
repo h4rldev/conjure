@@ -311,8 +311,9 @@ mod tests {
       fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
     assert_eq!(first, second);
 
-    // Editing the content changes the fingerprint.
-    std::fs::write(src.join("main.c"), "int main(void){return 1;}").unwrap();
+    // Editing the content changes the fingerprint. Use a different length so
+    // this does not depend on mtime granularity (coarse on some filesystems).
+    std::fs::write(src.join("main.c"), "int main(void){return 42;}").unwrap();
     let third =
       fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
     assert_ne!(first, third);
