@@ -38,6 +38,12 @@ on:
 permissions:
   contents: write
 
+# Re-running a tag's release (or dispatching it again) cancels the earlier run,
+# so a stuck build can be replaced instead of blocking or racing the new one.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CODEBERG_REPO: h4rl/conjure
 

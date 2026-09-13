@@ -98,6 +98,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A committed notes file is the multiline alternative to the UI's
+          # single-line `notes` input (the input wins when set). Sections are
+          # headed `# <tag>`; the one matching the tag being cut is used, so a
+          # new section is appended each release without clearing the file.
+          # Only a single `#` terminates a section - keep subheadings `##`+.
+          notes_file=.github/RELEASE_NOTES.md
+          if [ -z "${PREAMBLE:-}" ] && [ -f "$notes_file" ]; then
+            PREAMBLE="$(awk -v tag="$TAG" -v bare="${TAG#v}" '
+              ($0 == "# " tag || $0 == "# " bare) { grab = 1; next }
+              grab && substr($0, 1, 2) == "# " { exit }
+              grab { print }
+            ' "$notes_file")"
+            if [ -z "$PREAMBLE" ]; then
+              echo "warning: no '# $TAG' section in $notes_file" >&2
+            fi
+          fi
+
           # Map git author email -> Codeberg @login so Codeberg releases can
           # mention authors. Best-effort: an unlinked email falls back to
           # `Name <email>`, which is also the only form used on GitHub.

@@ -1,0 +1,145 @@
+# Undo a cut: delete the tag and its releases, and revert the version bump, so a
+# failed release can be re-cut from the previous version instead of incrementing
+# past it.
+#
+# Operates on Codeberg (canonical) for the ref and GitHub for the release object
+# and a mirrored tag that delete-sync may not have removed. Requires
+# `CODEBERG_TOKEN` (write access to the Codeberg repo).
+
+name: Uncut Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to remove (default: latest v* tag)"
+        type: string
+        required: false
+      revert:
+        description: "Also revert the `chore(release): <tag>` bump commit on the default branch"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Print what would happen without deleting or pushing anything"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CODEBERG_REPO: h4rl/conjure
+
+jobs:
+  uncut:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure git
+        run: |
+          git config user.name "conjure-release"
+          git config user.email "release@conjure.invalid"
+
+      - name: Resolve tag
+        id: target
+        env:
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            tag="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "refusing to remove non-release tag '$tag'" >&2
+            exit 1
+          fi
+          commit="$(git rev-list -n1 "$tag")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "removing $tag ($commit)"
+
+      - name: Delete GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+          else
+            echo "no GitHub release for $TAG"
+          fi
+
+      - name: Delete Codeberg release
+        if: ${{ !inputs.dry_run }}
+        env:
+          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          api="https://codeberg.org/api/v1/repos/${CODEBERG_REPO}/releases"
+          rid="$(curl -fsS -H "Authorization: token ${TOKEN}" "${api}?limit=100" \
+            | jq -r --arg t "$TAG" '.[] | select(.tag_name == $t) | .id' \
+            | head -n1)"
+          if [ -n "$rid" ] && [ "$rid" != "null" ]; then
+            curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" \
+              "${api}/${rid}"
+            echo "deleted Codeberg release $rid"
+          else
+            echo "no Codeberg release for $TAG"
+          fi
+
+      - name: Delete tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add codeberg \
+            "https://h4rl:${TOKEN}@codeberg.org/${CODEBERG_REPO}.git"
+          git push codeberg ":refs/tags/${TAG}"
+          # GitHub normally gets ref changes via the Codeberg mirror; delete the
+          # mirrored tag too so a mirror without delete-sync still drops it.
+          gh api -X DELETE \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" || true
+
+      - name: Revert the version bump
+        if: ${{ inputs.revert && !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+        run: |
+          set -euo pipefail
+          subject="$(git log -n1 --format=%s "$COMMIT")"
+          if [ "$subject" != "chore(release): ${TAG}" ]; then
+            echo "$TAG does not point at a release bump commit" \
+              "('$subject'); skipping revert"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT" HEAD; then
+            echo "$COMMIT is not on the default branch; skipping revert" >&2
+            exit 0
+          fi
+          git revert --no-edit "$COMMIT"
+          git push codeberg HEAD
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          REVERT: ${{ inputs.revert }}
+        run: |
+          echo "Dry run: would delete the releases for ${TAG}, remove the tag"
+          if [ "$REVERT" = "true" ]; then
+            echo "on both hosts, and revert its bump commit on the default branch"
+          else
+            echo "on both hosts (leaving the version bump in place)"
+          fi
