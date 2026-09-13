@@ -1092,3 +1092,169 @@ fn profile_tests_only_build_under_their_profile() {
       .is_file()
   );
 }
+
+#[test]
+fn output_map_controls_binary_layout() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("output_bin");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name out
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+  output {
+    bin "artifacts"
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("main.c"),
+    "int main(void) { return 0; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  assert!(
+    dir
+      .join("artifacts")
+      .join("default")
+      .join(exe("out"))
+      .is_file()
+  );
+}
+
+#[test]
+fn output_map_controls_library_layout() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("output_lib");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name outlib
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  output {
+    lib "artifacts-lib"
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("outlib.c"),
+    "int outlib(void) { return 1; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  let archive = if cfg!(target_env = "msvc") {
+    "outlib.lib"
+  } else {
+    "liboutlib.a"
+  };
+  assert!(
+    dir
+      .join("artifacts-lib")
+      .join("default")
+      .join(archive)
+      .is_file()
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_binaries_survives_rebuilds() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("symlink_rebuild");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name linkme
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+  output {
+    symlink_binaries #true
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("main.c"),
+    "int main(void) { return 0; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  let link = dir.join(exe("linkme"));
+  assert!(
+    link.symlink_metadata().is_ok(),
+    "no symlink at {}",
+    link.display()
+  );
+  assert_eq!(
+    fs::canonicalize(&link).unwrap(),
+    fs::canonicalize(dir.join("bin").join("default").join(exe("linkme")))
+      .unwrap()
+  );
+
+  // A forced relink must replace the existing link, not fail on it.
+  conjure(&dir, &["build", "--force"]);
+  assert!(link.symlink_metadata().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_targets_inherit_symlink_binaries() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("test_symlink");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name core
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  output {
+    symlink_binaries "true"
+  }
+  tests {
+    unit { src "src/test_unit.c" }
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("core.c"),
+    "int core(void) { return 42; }\n",
+  );
+  write(&dir.join("src").join("core.h"), "int core(void);\n");
+  write(
+    &dir.join("src").join("test_unit.c"),
+    "#include \"core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
+  );
+
+  conjure(&dir, &["test"]);
+  let link = dir.join(exe("unit"));
+  assert!(
+    link.symlink_metadata().is_ok(),
+    "no symlink at {}",
+    link.display()
+  );
+
+  // Test binaries always rebuild, so the link must be replaced on re-runs.
+  conjure(&dir, &["test"]);
+  assert!(link.symlink_metadata().is_ok());
+}

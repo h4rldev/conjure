@@ -339,8 +339,11 @@ pub struct Test {
 
 #[derive(Deserialize, Default, Clone, Serialize, Debug)]
 pub struct Output {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub bin: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub lib: Option<String>,
+  #[serde(default, deserialize_with = "de_kdl_bool")]
   pub symlink_binaries: Option<bool>,
 }
 
@@ -443,6 +446,46 @@ where
     Ok(None) => Ok(Linkage::Dynamic),
     Err(_) => Err(D::Error::custom("invalid linkage")),
   }
+}
+
+/// Accept a bool written as `#true`/`#false` (KDL v2) or `"true"`/`"false"`.
+fn de_kdl_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Bool;
+  impl<'de> serde::de::Visitor<'de> for Bool {
+    type Value = Option<bool>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+      f.write_str("`#true`/`#false` or `\"true\"`/`\"false\"`")
+    }
+    fn visit_bool<E: serde::de::Error>(
+      self,
+      v: bool,
+    ) -> Result<Self::Value, E> {
+      Ok(Some(v))
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+      match v {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        other => Err(E::custom(format!("expected true/false, got {other:?}"))),
+      }
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+      Ok(None)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+      Ok(None)
+    }
+    fn visit_some<D2: serde::Deserializer<'de>>(
+      self,
+      d: D2,
+    ) -> Result<Self::Value, D2::Error> {
+      d.deserialize_any(Bool)
+    }
+  }
+  d.deserialize_option(Bool)
 }
 
 /// The project file format.
@@ -631,7 +674,7 @@ impl Project {
     out
   }
 
-  /// Parse and validate a manifest.
+  /// Parse and validate a manifest.      ld_flags -lxkbcommon -lxkbcommon-x11 -lxcb -lxcb-cursor -lxcb-icccm -lxcb-randr -lbread-x11-release -lhtils -lvulkan -ldl
   pub fn from_str(input: &str) -> Result<Self, Error> {
     let project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
     if let Some(deps) = &project.dependencies {
@@ -922,5 +965,25 @@ mod tests {
       p.with_profile(Some(prof)).compile.unwrap().arch,
       Some(Arch::X86)
     );
+  }
+
+  #[test]
+  fn output_symlink_bool_accepts_kdl_and_quoted_forms() {
+    for value in ["#true", "\"true\""] {
+      let src = format!(
+        "project {{\n  name t\n  language c\n  type binary\n  output {{\n    symlink_binaries {value}\n  }}\n}}"
+      );
+      assert_eq!(
+        parse(&src).output.unwrap().symlink_binaries,
+        Some(true),
+        "{value}"
+      );
+    }
+
+    let src = "project {\n  name t\n  language c\n  type binary\n  output {\n    symlink_binaries #false\n  }\n}";
+    assert_eq!(parse(src).output.unwrap().symlink_binaries, Some(false));
+
+    let src = "project {\n  name t\n  language c\n  type binary\n  output {\n    bin \"out\"\n  }\n}";
+    assert_eq!(parse(src).output.unwrap().symlink_binaries, None);
   }
 }

@@ -212,9 +212,8 @@ pub fn test_project(
     profiles
   });
 
-  let bin = parent
-    .output
-    .as_ref()
+  let output = parent.output.as_ref();
+  let bin = output
     .and_then(|o| o.bin.clone())
     .unwrap_or_else(|| "bin".into());
 
@@ -231,7 +230,7 @@ pub fn test_project(
     output: Some(Output {
       bin: Some(output_bin),
       lib: None,
-      symlink_binaries: Some(false),
+      symlink_binaries: output.and_then(|o| o.symlink_binaries),
     }),
     ..Default::default()
   })

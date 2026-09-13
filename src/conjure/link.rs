@@ -184,11 +184,13 @@ fn try_raw_link(
 
 #[cfg(unix)]
 fn symlink_bin(target: &Path, link: &Path) -> Result<()> {
+  let _ = fs::remove_file(link);
   std::os::unix::fs::symlink(target, link).into_diagnostic()
 }
 
 #[cfg(windows)]
 fn symlink_bin(target: &Path, link: &Path) -> Result<()> {
+  let _ = fs::remove_file(link);
   std::os::windows::fs::symlink_file(target, link).into_diagnostic()
 }
 
