@@ -11,7 +11,21 @@ name: Test
 on:
   push:
     branches: [main, master]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".rustfmt.toml"
+      - ".github/workflows/test.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".rustfmt.toml"
+      - ".github/workflows/test.yml"
   workflow_dispatch:
 
 concurrency:
