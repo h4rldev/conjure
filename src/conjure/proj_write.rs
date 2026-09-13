@@ -30,11 +30,15 @@ const SECTION_COMMENTS: &[(&str, &str)] = &[
   ),
   (
     "profiles",
-    "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n  }",
+    "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n    tests { }                // profile-specific tests, merged over the top-level set\n  }",
   ),
   (
     "siblings",
     "co-built sibling conjure projects; each name maps to a directory holding\nits own conjure.kdl, built in the same `conjure build` invocation\n  sibling_name \"libs/sibling_name\"",
+  ),
+  (
+    "tests",
+    "test targets: each name compiles to a binary that links the project's\nlibrary, so the project must be `type library`; built by `conjure test` and\nnever run by conjure\n  test_name { src \"tests/test_name.c\" }",
   ),
   (
     "dependencies",

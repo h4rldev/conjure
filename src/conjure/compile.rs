@@ -12,6 +12,7 @@
 /***********************************************************************/
 
 use super::{
+  build,
   deps::dep_include_dirs,
   diag::{ReadDir, WritePath},
   proj_parse::{Flags, Language, Project},
@@ -85,6 +86,20 @@ pub fn collect_sources(
   Ok(sources)
 }
 
+/// Absolute roots of the project's declared test sources. A project's own build
+/// skips these so its tests are not compiled into the artifact it produces.
+pub fn test_source_roots(project: &Project, root: &Path) -> Vec<PathBuf> {
+  project
+    .tests
+    .as_ref()
+    .into_iter()
+    .flatten()
+    .filter_map(|(_, test)| test.src.as_ref())
+    .flat_map(Flags::list)
+    .map(|src| root.join(src))
+    .collect()
+}
+
 /// Build the compile invocation for every source in `project`.
 ///
 /// `root` is the project dir (sources, object paths, and `compile_commands`
@@ -109,7 +124,12 @@ pub fn compile_entries(
   };
 
   let roots = compile.src_roots();
-  let sources = collect_sources(root, &roots, exts)?;
+  let mut sources = collect_sources(root, &roots, exts)?;
+
+  let excludes = test_source_roots(project, root);
+  if !excludes.is_empty() {
+    sources.retain(|src| !excludes.iter().any(|e| src.starts_with(e)));
+  }
 
   miette::ensure!(
     !sources.is_empty(),
@@ -270,8 +290,25 @@ pub fn compile_commands(
         .into_iter()
         .map(|(_, e)| e),
     );
-  }
 
+    // Test sources are excluded from the project's own entries, so add one
+    // entry per test target using the same synthesis `conjure test` builds.
+    if let Some(tests) = &effective.tests {
+      let mut tests: Vec<_> = tests.iter().collect();
+      tests.sort_by(|a, b| a.0.cmp(b.0));
+      for (test_name, test) in tests {
+        let test_proj = build::test_project(&proj, test_name, test, profile)?;
+        let test_resolved = profile.and_then(|n| test_proj.profile(n));
+        let test_out = test_resolved.map_or("default", |(n, _)| n);
+        let test_eff = test_proj.with_profile(test_resolved.map(|(_, p)| p));
+        entries.extend(
+          compile_entries(&dir, &root, &test_eff, test_out, vec![])?
+            .into_iter()
+            .map(|(_, e)| e),
+        );
+      }
+    }
+  }
   fs::write(
     "compile_commands.json",
     serde_json::to_string_pretty(&entries).into_diagnostic()?,

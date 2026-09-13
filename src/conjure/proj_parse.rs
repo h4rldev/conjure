@@ -331,6 +331,12 @@ pub struct Sibling {
   pub path: String,
 }
 
+#[derive(Deserialize, Clone, Serialize, Debug)]
+pub struct Test {
+  #[serde(default)]
+  pub src: Option<Flags>,
+}
+
 #[derive(Deserialize, Default, Clone, Serialize, Debug)]
 pub struct Output {
   pub bin: Option<String>,
@@ -400,6 +406,8 @@ pub struct Profile {
   #[serde(default)]
   pub arch: Option<Arch>,
   #[serde(default)]
+  pub tests: Option<HashMap<String, Test>>,
+  #[serde(default)]
   pub dependencies: Option<HashMap<String, Dependency>>,
 }
 
@@ -468,6 +476,13 @@ where
 ///     alongside this one in the same `conjure build`)
 ///   }
 ///
+///   tests {
+///     name {
+///       src: [string] (source roots for this test binary; the project must be
+///       `type library` since the test links it)
+///     }
+///   }
+///
 ///   profiles {
 ///     name: string {
 ///       type, link, cc, linker, standard, arch: scalar overrides
@@ -502,8 +517,10 @@ pub struct Project {
   #[serde(deserialize_with = "de_slugify")]
   pub name: String,
   pub language: Language,
+
   #[serde(rename = "type")]
   pub ty: ProjectType,
+
   #[serde(default, deserialize_with = "de_linkage")]
   pub link: Linkage,
 
@@ -524,6 +541,9 @@ pub struct Project {
 
   #[serde(default)]
   pub siblings: Option<HashMap<String, Sibling>>,
+
+  #[serde(default)]
+  pub tests: Option<HashMap<String, Test>>,
 
   #[serde(default)]
   pub profiles: Option<HashMap<String, Profile>>,
@@ -548,6 +568,7 @@ impl Default for Project {
       description: None,
       compile: None,
       siblings: None,
+      tests: None,
       profiles: None,
       dependencies: None,
       output: None,
@@ -599,6 +620,14 @@ impl Project {
         merged.insert(k.clone(), v.clone());
       }
     }
+
+    if let Some(tests) = &p.tests {
+      let merged = out.tests.get_or_insert_with(Default::default);
+      for (k, v) in tests {
+        merged.insert(k.clone(), v.clone());
+      }
+    }
+
     out
   }
 

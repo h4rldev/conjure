@@ -18,7 +18,9 @@
 /***********************************************************************/
 
 use super::{
-  compile::{C_SRCS, CPP_SRCS, collect_sources, find_sources},
+  compile::{
+    C_SRCS, CPP_SRCS, collect_sources, find_sources, test_source_roots,
+  },
   deps::local_dep_fingerprint,
   diag::ReadPath,
   proj_parse::{Dependency, Language, Project},
@@ -193,7 +195,12 @@ pub fn fingerprint(
   items.extend(dep_commits.iter().map(|s| s.to_string()));
 
   let roots = compile.src_roots();
-  let sources = collect_sources(dir, &roots, exts)?;
+  let mut sources = collect_sources(dir, &roots, exts)?;
+
+  let excludes = test_source_roots(project, dir);
+  if !excludes.is_empty() {
+    sources.retain(|src| !excludes.iter().any(|e| src.starts_with(e)));
+  }
   items.extend(file_fingerprint(cache, &sources)?);
 
   if let Some(include) = &compile.include {

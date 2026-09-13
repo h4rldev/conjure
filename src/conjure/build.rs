@@ -15,7 +15,10 @@
 use super::{
   compile::{self, CompileEntry},
   deps, fingerprint, link, lock, proj_parse,
-  proj_parse::{Flags, Profile, Project},
+  proj_parse::{
+    BuildSystem, Dependency, Flags, Linkage, Output, Profile, Project,
+    ProjectType, Test,
+  },
   toolchain,
   ui::{StepStatus, Ui},
 };
@@ -36,6 +39,7 @@ pub struct BuildCtx<'a> {
   /// Selected profile *name*; resolved against `project`'s own profiles. A name
   /// the project does not define falls back to default (see `build_ctx`).
   pub profile: Option<&'a str>,
+  pub record_state: bool,
   pub force: bool,
 }
 
@@ -101,7 +105,8 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
   file_cache.save(&ctx.dir);
 
   let state_file = ctx.dir.join(".conjure/build/state.kdl");
-  let up_to_date = !ctx.force
+  let up_to_date = ctx.record_state
+    && !ctx.force
     && fs::read_to_string(&state_file).is_ok_and(|s| s == fp)
     && built_artifact(&project, &ctx.dir, &ctx.root, profile_name).exists();
   if up_to_date {
@@ -154,9 +159,82 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
 
   link::produce(ui, &project, &ctx.dir, &ctx.root, profile_name, &inputs)?;
 
-  let _ = fs::create_dir_all(state_file.parent().unwrap());
-  let _ = fs::write(state_file, fp);
+  if ctx.record_state {
+    let _ = fs::create_dir_all(state_file.parent().unwrap());
+    let _ = fs::write(state_file, fp);
+  }
   Ok(())
+}
+
+fn test_profile(p: Profile) -> Profile {
+  Profile {
+    ty: None,
+    link: None,
+    src: None,
+    tests: None,
+    ..p.clone()
+  }
+}
+
+pub fn test_project(
+  parent: &Project,
+  name: &str,
+  test: &Test,
+  profile: Option<&str>,
+) -> Result<Project> {
+  let src = test.src.clone().ok_or_else(|| {
+    miette::miette!(
+      help = "Test `{name}` must have a `src` specified",
+      "Test `{name}` has no `src`"
+    )
+  })?;
+
+  let mut compile = parent.compile.clone().unwrap_or_default();
+  compile.src = Some(src);
+
+  let mut dependencies = parent.dependencies.clone().unwrap_or_default();
+  dependencies.insert(
+    parent.name.clone(),
+    Dependency {
+      local: Some(".".into()),
+      build: Some(BuildSystem::Conjure(None)),
+      ..Default::default()
+    },
+  );
+
+  let profiles = parent.profiles.as_ref().map(|profiles| {
+    let mut profiles = profiles.clone();
+    if let Some(active) = profile
+      && let Some(p) = profiles.get(active).cloned()
+    {
+      profiles.insert(active.to_string(), test_profile(p));
+    }
+    profiles
+  });
+
+  let bin = parent
+    .output
+    .as_ref()
+    .and_then(|o| o.bin.clone())
+    .unwrap_or_else(|| "bin".into());
+
+  let output_bin = PathBuf::from(bin).join(name).display().to_string();
+
+  Ok(Project {
+    name: name.to_string(),
+    language: parent.language.clone(),
+    ty: ProjectType::Binary,
+    link: Linkage::Dynamic,
+    compile: Some(compile),
+    profiles,
+    dependencies: Some(dependencies),
+    output: Some(Output {
+      bin: Some(output_bin),
+      lib: None,
+      symlink_binaries: Some(false),
+    }),
+    ..Default::default()
+  })
 }
 
 /// Build a project and all of its siblings under the current directory.
@@ -175,6 +253,7 @@ pub fn build(
       root: cwd.clone(),
       profile,
       force,
+      record_state: true,
     },
     &ui,
   )?;
@@ -198,10 +277,64 @@ pub fn build(
           root: cwd.clone(),
           profile, // same *name*; build_ctx resolves it per sibling
           force,
+          record_state: true,
         },
         &ui,
       )?;
     }
+  }
+  Ok(())
+}
+
+pub fn test(
+  project: &Project,
+  profile: Option<&str>,
+  names: &[String],
+) -> Result<()> {
+  let resolved = profile.and_then(|name| project.profile(name));
+  let effective = project.with_profile(resolved.map(|(_, p)| p));
+
+  let tests = effective
+    .tests
+    .as_ref()
+    .filter(|t| !t.is_empty())
+    .ok_or_else(|| miette::miette!("No `tests` in conjure.kdl"))?;
+
+  miette::ensure!(
+    effective.is_library(),
+    help = "Tests link the project's library, so the selected profile must be `type library`",
+    "`{}` is not a library under this profile",
+    project.name
+  );
+  for want in names {
+    miette::ensure!(tests.contains_key(want), "test `{want}` not found");
+  }
+
+  let cwd = std::env::current_dir().into_diagnostic()?;
+  let ui = Ui::new();
+
+  let mut selected: Vec<(&String, &Test)> = tests
+    .iter()
+    .filter(|(name, _)| names.is_empty() || names.iter().any(|n| n == *name))
+    .collect();
+  selected.sort_by(|a, b| a.0.cmp(b.0));
+
+  for (name, target) in selected {
+    // `test_project` stays on the *raw* parent so `build_ctx` applies the
+    // profile once; it only uses `effective` for the tests lookup and the
+    // library check.
+    let child = test_project(project, name, target, profile)?;
+    build_ctx(
+      &BuildCtx {
+        project: &child,
+        dir: cwd.clone(),
+        root: cwd.clone(),
+        profile,
+        force: false,
+        record_state: false,
+      },
+      &ui,
+    )?;
   }
   Ok(())
 }

@@ -602,11 +602,18 @@ fn build_conjure_dep<'a>(
     root: ctx.root.to_path_buf(),
     profile: ctx.profile, // build_ctx resolves + prints the fallback note
     force: false,
+    record_state: true,
   };
 
   build::build_ctx(&child_ctx, ui)?;
   let out_profile = child_profile.map_or("default", |(n, _)| n);
-  Ok(link::library_path(&effective, ctx.root, out_profile, true))
+  let scoped = link::output_scoped(&effective, &dep_dir, ctx.root);
+  Ok(link::library_path(
+    &effective,
+    ctx.root,
+    out_profile,
+    scoped,
+  ))
 }
 
 /// One dependency's resolved work item for a build.

@@ -901,6 +901,77 @@ fn compile_commands_include_siblings() {
   );
 }
 
+#[test]
+fn compile_commands_are_structured_and_cover_tests() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("ccjson_struct");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name core
+  language c
+  type library
+  link dynamic
+  compile { standard c11 }
+  tests {
+    unit { src "src/test/unit.c" }
+  }
+}
+"#,
+  );
+  write(&dir.join("src/core.c"), "int core(void) { return 42; }\n");
+  write(&dir.join("src/core.h"), "int core(void);\n");
+  write(
+    &dir.join("src/test/unit.c"),
+    "#include \"../core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
+  );
+
+  conjure(&dir, &["compile-commands"]);
+  let text = fs::read_to_string(dir.join("compile_commands.json")).unwrap();
+  let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+  assert_eq!(entries.len(), 2, "{text}");
+
+  let canon = |p: &str| fs::canonicalize(p).unwrap();
+  let root = fs::canonicalize(&dir).unwrap();
+  let core = fs::canonicalize(dir.join("src").join("core.c")).unwrap();
+  let unit =
+    fs::canonicalize(dir.join("src").join("test").join("unit.c")).unwrap();
+
+  for entry in &entries {
+    assert_eq!(canon(entry["directory"].as_str().unwrap()), root, "{entry}");
+  }
+
+  let files: Vec<PathBuf> = entries
+    .iter()
+    .map(|e| canon(e["file"].as_str().unwrap()))
+    .collect();
+  assert_eq!(files.iter().filter(|f| **f == core).count(), 1, "{text}");
+  assert_eq!(files.iter().filter(|f| **f == unit).count(), 1, "{text}");
+
+  let compiles = |entry: &serde_json::Value, want: &Path| {
+    entry["arguments"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|a| fs::canonicalize(a.as_str().unwrap()).is_ok_and(|p| p == want))
+  };
+  let entry_for = |file: &Path| {
+    entries
+      .iter()
+      .find(|e| canon(e["file"].as_str().unwrap()) == *file)
+      .unwrap()
+  };
+
+  // The project's own entry compiles core.c, not the test source.
+  assert!(compiles(entry_for(&core), &core));
+  assert!(!compiles(entry_for(&core), &unit));
+  // The test target compiles the test source, not the project's.
+  assert!(compiles(entry_for(&unit), &unit));
+  assert!(!compiles(entry_for(&unit), &core));
+}
+
 /// A non-native `--arch x86` must resolve the matching `vcvarsall.bat x86`
 /// environment, not the host x64 one, and actually emit a 32-bit PE.
 /// Windows-msvc only; needs VS's x86 tools installed.
@@ -922,4 +993,88 @@ fn pe_machine(path: &Path) -> u16 {
   let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
   assert_eq!(&bytes[pe..pe + 4], b"PE\0\0");
   u16::from_le_bytes(bytes[pe + 4..pe + 6].try_into().unwrap())
+}
+
+#[test]
+fn test_targets_link_the_parent_library() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("tests_field");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name core
+  language c
+  type library
+  link dynamic
+  compile { standard c11 }
+  tests {
+    unit { src "src/test/unit.c" }
+  }
+}
+"#,
+  );
+  write(&dir.join("src/core.c"), "int core(void) { return 42; }\n");
+  write(&dir.join("src/core.h"), "int core(void);\n");
+  write(
+    &dir.join("src/test/unit.c"),
+    "#include \"../core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
+  );
+
+  conjure(&dir, &["test"]);
+  assert!(
+    dir
+      .join("bin")
+      .join("unit")
+      .join("default")
+      .join(exe("unit"))
+      .is_file()
+  );
+}
+
+#[test]
+fn profile_tests_only_build_under_their_profile() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("profile_tests");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name app
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+  profiles {
+    lib {
+      type library
+      tests { unit { src "src/test/unit.c" } }
+    }
+  }
+}
+"#,
+  );
+  write(&dir.join("src/main.c"), "int main(void) { return 0; }\n");
+  write(&dir.join("src/lib.c"), "int core(void) { return 42; }\n");
+  write(&dir.join("src/core.h"), "int core(void);\n");
+  write(
+    &dir.join("src/test/unit.c"),
+    "#include \"../core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
+  );
+
+  // Base is a binary with no tests, so plain `test` has nothing to build.
+  assert!(!run(&dir, &["test"]).status.success());
+
+  // Under `lib` the project is a library and the profile's tests apply.
+  conjure(&dir, &["test", "-p", "lib"]);
+  assert!(
+    dir
+      .join("bin")
+      .join("unit")
+      .join("lib")
+      .join(exe("unit"))
+      .is_file()
+  );
 }

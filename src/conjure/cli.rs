@@ -251,17 +251,30 @@ struct BuildArgs {
 
 #[derive(Args)]
 struct CompileCommandsArgs {
+  /// Profile to use for making the compile_commands.json
   #[arg(long, short = 'p')]
   profile: Option<String>,
+  /// Don't build siblings
   #[arg(long, short = 's')]
   no_siblings: bool,
 }
 
 #[derive(Args)]
 struct AsArgs {
+  /// Profile to use for the subcommand
   profile: String,
+  /// Subcommand to run (all --help commands are supported)
   #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
   subcommand: Vec<String>,
+}
+
+#[derive(Args)]
+struct TestArgs {
+  /// Names of the tests to build (If empty, build all)
+  names: Vec<String>,
+  /// Profile to use for building the tests
+  #[arg(long, short = 'p')]
+  profile: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -286,6 +299,8 @@ enum Commands {
   Compile(CompileCommandsArgs),
   /// Run a subcommand as a specific profile
   As(AsArgs),
+  /// Build the project's tests
+  Test(TestArgs),
 }
 
 fn styles() -> Styles {
@@ -415,6 +430,7 @@ fn build_project(
       ),
     ])),
     dependencies: Some(HashMap::new()),
+    tests: Some(HashMap::new()),
     ..Default::default()
   }
 }
@@ -961,6 +977,24 @@ fn handle_build(args: &BuildArgs) -> Result<()> {
   build::build(&project, profile.as_deref(), args.force, !args.no_siblings)
 }
 
+fn handle_test(args: &TestArgs) -> Result<()> {
+  let project = Project::from_file("conjure.kdl")?;
+  let profile = args
+    .profile
+    .clone()
+    .or_else(|| std::env::var("CONJURE_PROFILE").ok());
+  if let Some(name) = profile.as_deref() {
+    miette::ensure!(
+      project
+        .profiles
+        .as_ref()
+        .is_some_and(|m| m.contains_key(name)),
+      "profile `{name}` not found"
+    );
+  }
+  build::test(&project, profile.as_deref(), &args.names)
+}
+
 fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
   let project = Project::from_file("conjure.kdl")?;
   let ui = Ui::new();
@@ -1023,6 +1057,7 @@ fn run_command(cmd: &Commands) -> Result<()> {
     Commands::Update(args) => handle_update(args)?,
     Commands::Build(args) => handle_build(args)?,
     Commands::Compile(args) => handle_compile_commands(args)?,
+    Commands::Test(args) => handle_test(args)?,
     Commands::As(_) => unreachable!(),
   }
   Ok(())
