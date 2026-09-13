@@ -279,6 +279,7 @@ fn merge_flags(base: Option<&Flags>, over: Option<&Flags>) -> Option<Flags> {
 }
 
 #[derive(Deserialize, Default, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Compile {
   pub cc: Option<String>,
   pub linker: Option<String>,
@@ -326,18 +327,21 @@ impl Compile {
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Sibling {
   #[serde(rename = "#0")]
   pub path: String,
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Test {
   #[serde(default)]
   pub src: Option<Flags>,
 }
 
 #[derive(Deserialize, Default, Clone, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Output {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub bin: Option<String>,
@@ -348,6 +352,7 @@ pub struct Output {
 }
 
 #[derive(Deserialize, Clone, Default, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Dependency {
   #[serde(default)]
   pub remote: Option<Remote>,
@@ -385,6 +390,7 @@ impl Dependency {
 }
 
 #[derive(Deserialize, Clone, Default, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
   #[serde(default, rename = "type")]
   pub ty: Option<ProjectType>,
@@ -556,6 +562,7 @@ where
 /// }
 /// ```
 #[derive(Deserialize, Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Project {
   #[serde(deserialize_with = "de_slugify")]
   pub name: String,
@@ -696,6 +703,7 @@ impl Project {
 
 /// KDL wrapper: the document's single `project` node.
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectKDL {
   pub project: Project,
 }
@@ -985,5 +993,17 @@ mod tests {
 
     let src = "project {\n  name t\n  language c\n  type binary\n  output {\n    bin \"out\"\n  }\n}";
     assert_eq!(parse(src).output.unwrap().symlink_binaries, None);
+  }
+
+  #[test]
+  fn unknown_fields_are_rejected() {
+    for src in [
+      "project {\n  name t\n  language c\n  type binary\n  mystery 1\n}",
+      "project {\n  name t\n  language c\n  type binary\n  compile {\n    mystery 1\n  }\n}",
+      "project {\n  name t\n  language c\n  type binary\n  profiles {\n    p {\n      mystery 1\n    }\n  }\n}",
+      "project {\n  name t\n  language c\n  type binary\n  output {\n    symlink_binary #true\n  }\n}",
+    ] {
+      assert!(Project::from_str(src).is_err(), "should reject: {src}");
+    }
   }
 }
