@@ -74,6 +74,17 @@ fn shared(name: &str) -> String {
   }
 }
 
+/// MSVC's linker needs an import library, which conjure doesn't emit for shared
+/// libraries yet, so parent libraries link statically there; gnu/unix link the
+/// `.dll`/`.so` directly.
+fn parent_link() -> &'static str {
+  if cfg!(target_env = "msvc") {
+    "static"
+  } else {
+    "dynamic"
+  }
+}
+
 /// These build through the real `cc`/`ar`; skip quietly where there is none.
 fn have_cc() -> bool {
   cfg!(windows) || Command::new("cc").arg("--version").output().is_ok()
@@ -1001,24 +1012,27 @@ fn test_targets_link_the_parent_library() {
     return;
   }
   let dir = tmp("tests_field");
-  write(
-    &dir.join("conjure.kdl"),
-    r#"project {
+
+  let manifest = r#"project {
   name core
   language c
   type library
-  link dynamic
+  link PARENT_LINK
   compile { standard c11 }
   tests {
     unit { src "src/test/unit.c" }
   }
 }
-"#,
-  );
-  write(&dir.join("src/core.c"), "int core(void) { return 42; }\n");
-  write(&dir.join("src/core.h"), "int core(void);\n");
+"#
+  .replace("PARENT_LINK", parent_link());
+  write(&dir.join("conjure.kdl"), &manifest);
   write(
-    &dir.join("src/test/unit.c"),
+    &dir.join("src").join("core.c"),
+    "int core(void) { return 42; }\n",
+  );
+  write(&dir.join("src").join("core.h"), "int core(void);\n");
+  write(
+    &dir.join("src").join("test").join("unit.c"),
     "#include \"../core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
   );
 
@@ -1039,9 +1053,7 @@ fn profile_tests_only_build_under_their_profile() {
     return;
   }
   let dir = tmp("profile_tests");
-  write(
-    &dir.join("conjure.kdl"),
-    r#"project {
+  let manifest = r#"project {
   name app
   language c
   type binary
@@ -1050,17 +1062,19 @@ fn profile_tests_only_build_under_their_profile() {
   profiles {
     lib {
       type library
+      link PROFILE_LINK
       tests { unit { src "src/test/unit.c" } }
     }
   }
 }
-"#,
-  );
+"#
+  .replace("PROFILE_LINK", parent_link());
+  write(&dir.join("conjure.kdl"), &manifest);
   write(&dir.join("src/main.c"), "int main(void) { return 0; }\n");
   write(&dir.join("src/lib.c"), "int core(void) { return 42; }\n");
   write(&dir.join("src/core.h"), "int core(void);\n");
   write(
-    &dir.join("src/test/unit.c"),
+    &dir.join("src").join("test").join("unit.c"),
     "#include \"../core.h\"\nint main(void) { return core() == 42 ? 0 : 1; }\n",
   );
 
