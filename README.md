@@ -23,6 +23,9 @@ replacing them.
   `clang-cl`).
 - Content-hashed source fingerprinting so unchanged builds are skipped.
 - `compile_commands.json` generation for clangd.
+- Test targets (`tests { ... }`) built by `conjure test`; each links the
+  project's library, and test sources stay out of the normal build (they also
+  get their own clangd entries).
 - Target architecture selection (`x86_64`, `x64`, `arm64`).
 
 ## Installation
@@ -56,7 +59,12 @@ conjure build                    # build
 conjure build -p release         # build a profile
 conjure as release -- build      # run a command under a profile
 conjure compile-commands         # write compile_commands.json for clangd
+conjure test                     # build all test targets
+conjure test unit                # build one test target
+conjure build --no-siblings      # skip co-built sibling projects
 ```
+
+
 
 ### A minimal conjure.kdl
 
@@ -80,6 +88,30 @@ project {
 ```
 
 See [example/](example/) for a more complete example.
+
+### Tests
+
+Declare test binaries under `tests`, at the top level or inside a profile.
+Each one compiles to a binary that links the project's library, so the project
+must be `type library` under the selected profile.
+
+```kdl
+tests {
+  unit { src "src/test/unit.c" }
+}
+
+profiles {
+  lib {
+    type library
+    link static
+    tests { integration { src "tests/integration.c" } }
+  }
+}
+```
+
+`conjure test` builds every target; `conjure test <name>` builds one. Test
+sources are excluded from the project's own build and `conjure compile-commands`
+emits entries for them.
 
 ## Runtime dependencies
 - A C/C++ compiler: any GCC-cli-compatible compiler, or MSVC cl on Windows.
