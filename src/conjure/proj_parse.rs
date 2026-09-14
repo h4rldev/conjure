@@ -466,6 +466,7 @@ pub struct PcOptions {
   /// Defaults to `Project.description`.
   pub description: Option<String>,
   /// Extra `Requires.private` packages; defaults to the deps' `pkg_config` names.
+  #[serde(default, deserialize_with = "de_string_list")]
   pub requires: Option<Vec<String>>,
 }
 
@@ -680,6 +681,48 @@ where
     }
   }
   d.deserialize_option(Bool)
+}
+
+/// Accept a node argument as either a single string or a list of them. Needed
+/// inside the untagged [`GeneratePc`], where kdl's buffered form flattens a lone
+/// argument to a scalar that `Vec<String>` rejects.
+fn de_string_list<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct V;
+  impl<'de> serde::de::Visitor<'de> for V {
+    type Value = Option<Vec<String>>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+      f.write_str("A string or a list of strings")
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+      Ok(Some(vec![v.to_string()]))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+      self,
+      mut seq: A,
+    ) -> Result<Self::Value, A::Error> {
+      let mut out = Vec::new();
+      while let Some(s) = seq.next_element::<String>()? {
+        out.push(s);
+      }
+      Ok(Some(out))
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+      Ok(None)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+      Ok(None)
+    }
+    fn visit_some<D2: serde::Deserializer<'de>>(
+      self,
+      d: D2,
+    ) -> Result<Self::Value, D2::Error> {
+      d.deserialize_any(V)
+    }
+  }
+  d.deserialize_option(V)
 }
 
 /// The project file format.
@@ -1307,5 +1350,32 @@ mod tests {
 
     let cycle = "project {\n  name t\n  language c\n  type binary\n  profiles {\n    a {\n      extends \"b\"\n    }\n    b {\n      extends \"a\"\n    }\n  }\n}";
     assert!(Project::from_str(cycle).is_err());
+  }
+
+  #[test]
+  fn generate_pc_requires_accepts_one_or_many() {
+    let one = parse(
+      "project {\n  name t\n  language c\n  type library\n  link static\n  generate_pc {\n    requires \"zlib\"\n  }\n}",
+    );
+    assert_eq!(
+      one
+        .generate_pc
+        .as_ref()
+        .and_then(GeneratePc::options)
+        .and_then(|o| o.requires.clone()),
+      Some(vec!["zlib".to_string()])
+    );
+
+    let two = parse(
+      "project {\n  name t\n  language c\n  type library\n  link static\n  generate_pc {\n    requires \"zlib\" \"harfbuzz\"\n  }\n}",
+    );
+    assert_eq!(
+      two
+        .generate_pc
+        .as_ref()
+        .and_then(GeneratePc::options)
+        .and_then(|o| o.requires.clone()),
+      Some(vec!["zlib".to_string(), "harfbuzz".to_string()])
+    );
   }
 }
