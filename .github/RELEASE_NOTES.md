@@ -37,6 +37,11 @@ link it, so a project can link against a shared conjure dependency on MSVC.
 
 ### Smaller
 - `conjure new` documents the new `tests`/profile fields.
+- `conjure build` and `conjure test` accept `-j`/`--threads` (alias `--jobs`) to
+  override the manifest's `compile.threads` for that run, including dependency
+  builds.
+- Unknown fields in `conjure.kdl` are now errors instead of being silently
+  ignored, so a misplaced or misspelled section fails loudly.
 
 # v0.3.3
 

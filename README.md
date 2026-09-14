@@ -12,17 +12,22 @@ replacing them.
 - One manifest (`conjure.kdl`) describing sources, compiler/linker settings,
   dependencies, profiles, and multiple co-built projects.
 - Parallel compilation (Rayon) and parallel dependency fetching.
+- Incremental builds: each object is tracked by content hash and the headers it
+  includes, so only changed sources — and the objects that include a changed
+  header — recompile.
 - Profiles that can override far more than flags: `type`, `link`, `cc`,
-  `linker`, `standard`, `arch`, sources, includes, and dependencies.
+  `linker`, `standard`, `arch`, sources, includes, dependencies, and the
+  artifact name, and that can inherit from others with `extends`.
 - Dependencies from local paths or git remotes (Codeberg, GitHub, Bitbucket, or
   any URL), pinned in a lockfile and cached per project scope.
 - Build-system interop: Make, CMake, Autotools, Meson, Ninja, Xmake, Just, a
   free-form command, or Conjure itself (`build: conjure`).
 - Toolchain support for GCC/Clang and every GCC-cli-compatible compiler
   (including cross compilers, `zig cc`, `tcc`, MinGW-w64), plus MSVC (`cl` /
-  `clang-cl`).
-- Content-hashed source fingerprinting so unchanged builds are skipped.
+  `clang-cl`); shared libraries emit import libraries on MSVC.
 - `compile_commands.json` generation for clangd.
+- pkg-config file (`.pc`) generation for libraries, relocatable and on by
+  default (`generate_pc #false` to disable).
 - Test targets (`tests { ... }`) built by `conjure test`; each links the
   project's library, and test sources stay out of the normal build (they also
   get their own clangd entries).
@@ -63,8 +68,6 @@ conjure test                     # build all test targets
 conjure test unit                # build one test target
 conjure build --no-siblings      # skip co-built sibling projects
 ```
-
-
 
 ### A minimal conjure.kdl
 
@@ -112,6 +115,10 @@ profiles {
 `conjure test` builds every target; `conjure test <name>` builds one. Test
 sources are excluded from the project's own build and `conjure compile-commands`
 emits entries for them.
+
+A target can add its own `c_flags`, `ld_flags`, and `include`, merged over the
+project's for that target only — so test-only defines and include dirs don't
+leak into the library.
 
 ## Runtime dependencies
 - A C/C++ compiler: any GCC-cli-compatible compiler, or MSVC cl on Windows.

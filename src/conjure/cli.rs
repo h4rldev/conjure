@@ -248,6 +248,8 @@ struct BuildArgs {
   force: bool,
   #[arg(long, short = 's')]
   no_siblings: bool,
+  #[arg(long, short = 'j', alias = "jobs")]
+  threads: Option<usize>,
 }
 
 #[derive(Args)]
@@ -275,6 +277,9 @@ struct TestArgs {
   /// Profile to use for building the tests
   #[arg(long, short = 'p')]
   profile: Option<String>,
+  /// Threads to use for building the tests
+  #[arg(long, short = 'j', alias = "jobs")]
+  threads: Option<usize>,
 }
 
 /// Subcommands `conjure as` forwards to. Mirrors [`Commands`] minus `As`:
@@ -1017,7 +1022,13 @@ fn handle_build(args: &BuildArgs) -> Result<()> {
     );
   }
 
-  build::build(&project, profile.as_deref(), args.force, !args.no_siblings)
+  build::build(
+    &project,
+    profile.as_deref(),
+    args.force,
+    !args.no_siblings,
+    args.threads,
+  )
 }
 
 fn handle_test(args: &TestArgs) -> Result<()> {
@@ -1035,7 +1046,7 @@ fn handle_test(args: &TestArgs) -> Result<()> {
       "profile `{name}` not found"
     );
   }
-  build::test(&project, profile.as_deref(), &args.names)
+  build::test(&project, profile.as_deref(), &args.names, args.threads)
 }
 
 fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {

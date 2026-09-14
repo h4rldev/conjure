@@ -42,6 +42,7 @@ pub struct BuildCtx<'a> {
   pub profile: Option<&'a str>,
   pub record_state: bool,
   pub force: bool,
+  pub threads: Option<usize>,
 }
 
 impl<'a> BuildCtx<'a> {
@@ -161,7 +162,12 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     )?;
   }
   let profile_name = ctx.profile_name();
-  let project = ctx.project.with_profile(ctx.resolve().map(|(_, p)| p));
+  let mut project = ctx.project.with_profile(ctx.resolve().map(|(_, p)| p));
+  if let Some(threads) = ctx.threads
+    && let Some(compile) = project.compile.as_mut()
+  {
+    compile.threads = Some(threads);
+  }
 
   let lock = lock::LockFile::load(ctx.dir.join("conjure.lock"))?;
   let dep_commits: Vec<String> =
@@ -401,6 +407,7 @@ pub fn build(
   profile: Option<&str>,
   force: bool,
   siblings: bool,
+  threads: Option<usize>,
 ) -> Result<()> {
   let cwd = std::env::current_dir().into_diagnostic()?;
   let ui = Ui::new();
@@ -411,6 +418,7 @@ pub fn build(
       root: cwd.clone(),
       profile,
       force,
+      threads,
       record_state: true,
     },
     &ui,
@@ -435,6 +443,7 @@ pub fn build(
           root: cwd.clone(),
           profile, // same *name*; build_ctx resolves it per sibling
           force,
+          threads,
           record_state: true,
         },
         &ui,
@@ -448,6 +457,7 @@ pub fn test(
   project: &Project,
   profile: Option<&str>,
   names: &[String],
+  threads: Option<usize>,
 ) -> Result<()> {
   let resolved = profile.and_then(|name| project.profile(name));
   let effective = project.with_profile(resolved.map(|(_, p)| p));
@@ -489,6 +499,7 @@ pub fn test(
         root: cwd.clone(),
         profile,
         force: false,
+        threads,
         record_state: false,
       },
       &ui,

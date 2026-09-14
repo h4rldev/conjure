@@ -467,6 +467,7 @@ pub struct ConjureCtx<'a> {
   pub dir: &'a Path,  // parent project dir
   pub root: &'a Path, // invocation root
   pub profile: Option<&'a str>,
+  pub threads: usize,
 }
 
 /// Synthesize a manifestless dep project: the parent's compile settings
@@ -603,6 +604,7 @@ fn build_conjure_dep<'a>(
     root: ctx.root.to_path_buf(),
     profile: ctx.profile, // build_ctx resolves + prints the fallback note
     force: false,
+    threads: Some(ctx.threads),
     record_state: true,
   };
 
@@ -821,6 +823,7 @@ pub fn build_deps(
     dir,
     root,
     profile,
+    threads,
   };
 
   let mut libs = Vec::with_capacity(jobs.len());
