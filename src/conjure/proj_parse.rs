@@ -403,6 +403,102 @@ impl Dependency {
   }
 }
 
+#[derive(Deserialize, Clone, Serialize, Debug)]
+#[serde(untagged)]
+pub enum GeneratePc {
+  /// Shorthand: `generate_pc #false` / `#true`.
+  Enabled(bool),
+  /// `generate_pc { ... }`
+  Options(PcOptions),
+}
+
+impl GeneratePc {
+  /// Whether generation is on (an options block defaults to on).
+  pub fn enabled(&self) -> bool {
+    match self {
+      Self::Enabled(on) => *on,
+      Self::Options(o) => o.enabled.unwrap_or(true),
+    }
+  }
+
+  /// The options block, when this is the block form.
+  pub fn options(&self) -> Option<&PcOptions> {
+    match self {
+      Self::Options(o) => Some(o),
+      Self::Enabled(_) => None,
+    }
+  }
+
+  pub fn merged(self, over: &GeneratePc) -> GeneratePc {
+    GeneratePc::Options(self.into_options().merge(over.to_options()))
+  }
+
+  fn into_options(self) -> PcOptions {
+    match self {
+      GeneratePc::Enabled(on) => PcOptions {
+        enabled: Some(on),
+        ..Default::default()
+      },
+      GeneratePc::Options(o) => o,
+    }
+  }
+
+  fn to_options(&self) -> PcOptions {
+    match self {
+      GeneratePc::Enabled(on) => PcOptions {
+        enabled: Some(*on),
+        ..Default::default()
+      },
+      GeneratePc::Options(o) => o.clone(),
+    }
+  }
+}
+
+#[derive(Deserialize, Clone, Default, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PcOptions {
+  #[serde(default, deserialize_with = "de_kdl_bool")]
+  pub enabled: Option<bool>,
+  /// Install prefix; unset keeps the relocatable `${pcfiledir}` form.
+  pub prefix: Option<String>,
+  /// Defaults to `Project.version`.
+  pub version: Option<String>,
+  /// Defaults to `Project.description`.
+  pub description: Option<String>,
+  /// Extra `Requires.private` packages; defaults to the deps' `pkg_config` names.
+  pub requires: Option<Vec<String>>,
+}
+
+impl PcOptions {
+  /// `over` wins on scalars; `requires` accumulates (deduped).
+  fn merge(mut self, over: PcOptions) -> PcOptions {
+    self.enabled = over.enabled.or(self.enabled);
+    self.prefix = over.prefix.or(self.prefix);
+    self.version = over.version.or(self.version);
+    self.description = over.description.or(self.description);
+    if let Some(mut extra) = over.requires {
+      let mut base = self.requires.take().unwrap_or_default();
+      base.append(&mut extra);
+      base.sort();
+      base.dedup();
+      self.requires = Some(base);
+    }
+    self
+  }
+}
+
+/// Fold an optional `generate_pc` override over a base, field-wise.
+fn merge_generate_pc(
+  base: Option<GeneratePc>,
+  over: Option<&GeneratePc>,
+) -> Option<GeneratePc> {
+  match (base, over) {
+    (base, None) => base,
+    (None, Some(over)) => Some(over.clone()),
+    (Some(base), Some(over)) => Some(base.merged(over)),
+  }
+}
+
 #[derive(Deserialize, Clone, Default, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -412,8 +508,8 @@ pub struct Profile {
   pub link: Option<Linkage>,
   #[serde(default)]
   pub artifact: Option<String>,
-  #[serde(default, deserialize_with = "de_kdl_bool")]
-  pub generate_pc: Option<bool>,
+  #[serde(default)]
+  pub generate_pc: Option<GeneratePc>,
   #[serde(default)]
   pub cc: Option<String>,
   #[serde(default)]
@@ -453,7 +549,8 @@ impl Profile {
     self.arch = other.arch.or(self.arch);
     self.threads = other.threads.or(self.threads);
     self.artifact = other.artifact.clone().or(self.artifact);
-    self.generate_pc = other.generate_pc.or(self.generate_pc);
+    self.generate_pc =
+      merge_generate_pc(self.generate_pc, other.generate_pc.as_ref());
     self.include = merge_flags(self.include.as_ref(), other.include.as_ref());
     self.src = merge_flags(self.src.as_ref(), other.src.as_ref());
     self.c_flags = merge_flags(self.c_flags.as_ref(), other.c_flags.as_ref());
@@ -596,7 +693,11 @@ where
 ///   type: string (binary | library)
 ///   link: string (dynamic | static; default dynamic)
 ///   artifact: string (name of the artifact; defaults to name)
-///   generate_pc: bool (whether to generate a .pc file; default true)
+///   generate_pc: bool | object (write a `.pc` for a library; default true).
+///     `#false` disables it. A block sets `enabled`, `prefix` (install prefix;
+///     default stays relocatable), `version`/`description` (default the
+///     project's), and `requires` (extra `Requires.private` packages; the deps'
+///     `pkg_config` names are added automatically).
 ///   license: string
 ///   authors: [string]
 ///   description: string
@@ -674,8 +775,8 @@ pub struct Project {
   #[serde(default)]
   pub artifact: Option<String>,
 
-  #[serde(default, deserialize_with = "de_kdl_bool")]
-  pub generate_pc: Option<bool>,
+  #[serde(default)]
+  pub generate_pc: Option<GeneratePc>,
 
   #[serde(default)]
   pub version: Option<String>,
@@ -773,9 +874,8 @@ impl Project {
       out.artifact = Some(artifact.clone());
     }
 
-    if let Some(generate_pc) = p.generate_pc {
-      out.generate_pc = Some(generate_pc);
-    }
+    out.generate_pc =
+      merge_generate_pc(out.generate_pc, p.generate_pc.as_ref());
 
     out.compile = Some(out.compile.clone().unwrap_or_default().with_profile(p));
     if let Some(deps) = &p.dependencies {

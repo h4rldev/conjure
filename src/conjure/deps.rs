@@ -161,6 +161,18 @@ fn find_lib(dir: &Path, want_static: bool) -> Result<PathBuf> {
   }
 }
 
+/// Whether a token is link-relevant (`-l`/`-L`, raw `-Wl,`, `-pthread`, or a
+/// library file path) rather than a compiler-only flag.
+pub fn is_link_flag(tok: &str) -> bool {
+  tok.starts_with("-l")
+    || tok.starts_with("-L")
+    || tok.starts_with("-Wl,")
+    || tok == "-pthread"
+    || [".a", ".so", ".dylib", ".lib", ".dll"]
+      .iter()
+      .any(|ext| tok.ends_with(ext))
+}
+
 /// Split pkg-config output into `(cflags, libs)`: `-l`/`-L`/`-Wl,`/`-pthread`
 /// are link inputs, everything else is a compile flag.
 fn split_cflags_and_libs(output: &str) -> (Vec<String>, Vec<String>) {
@@ -168,11 +180,7 @@ fn split_cflags_and_libs(output: &str) -> (Vec<String>, Vec<String>) {
   let mut libs = vec![];
 
   for tok in output.split_whitespace() {
-    if tok.starts_with("-l")
-      || tok.starts_with("-L")
-      || tok.starts_with("-Wl,")
-      || tok == "-pthread"
-    {
+    if is_link_flag(tok) {
       libs.push(tok.to_string());
     } else {
       cflags.push(tok.to_string());

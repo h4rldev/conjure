@@ -1,3 +1,34 @@
+# v0.4.1
+
+Highlights since 0.4.0.
+
+### Useful pkg-config files
+
+Generated `.pc` files now describe the real static link closure. `Libs.private`
+gains the project's link flags from `ld_flags` (`-l`, `-L`, raw `-Wl,`,
+`-pthread`, and library paths; compiler-only flags like `-O2` are dropped)
+alongside its dependency libraries, and declared `pkg_config` packages are
+referenced as package names in `Requires.private` instead of flattened `-l`
+tokens.
+
+### Configurable `generate_pc`
+
+`generate_pc` accepts a block as well as the `#true`/`#false` shorthand:
+
+```
+generate_pc {
+  prefix "/opt/foo"
+  version "1.2.3"
+  description "..."
+  requires "zlib"
+}
+```
+
+`prefix` pins an install location (the default stays relocatable through
+`${pcfiledir}`), `version` and `description` override the project's, and
+`requires` adds packages to `Requires.private`. A profile's block merges field
+by field over the project's.
+
 # v0.4.0
 
 Highlights since 0.3.3.

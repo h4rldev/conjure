@@ -13,8 +13,8 @@ replacing them.
   dependencies, profiles, and multiple co-built projects.
 - Parallel compilation (Rayon) and parallel dependency fetching.
 - Incremental builds: each object is tracked by content hash and the headers it
-  includes, so only changed sources — and the objects that include a changed
-  header — recompile.
+  includes, so only changed sources - and the objects that include a changed
+  header - recompile.
 - Profiles that can override far more than flags: `type`, `link`, `cc`,
   `linker`, `standard`, `arch`, sources, includes, dependencies, and the
   artifact name, and that can inherit from others with `extends`.
@@ -117,7 +117,7 @@ sources are excluded from the project's own build and `conjure compile-commands`
 emits entries for them.
 
 A target can add its own `c_flags`, `ld_flags`, and `include`, merged over the
-project's for that target only — so test-only defines and include dirs don't
+project's for that target only - so test-only defines and include dirs don't
 leak into the library.
 
 ## Runtime dependencies

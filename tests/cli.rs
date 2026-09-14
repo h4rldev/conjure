@@ -1642,3 +1642,136 @@ fn as_forwards_subcommand_help() {
   let text = String::from_utf8_lossy(&out.stdout);
   assert!(text.contains("--force"), "{text}");
 }
+
+#[test]
+fn pkg_config_private_lists_link_deps_only() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("pc_private");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name greet
+  language c
+  type library
+  link static
+  compile { 
+    standard c11  
+    ld_flags -lfoo -lm -O2
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("greet.c"),
+    "int greet(void) { return 42; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  let pc = dir
+    .join("lib")
+    .join("default")
+    .join("pkgconfig")
+    .join("greet.pc");
+  let text = fs::read_to_string(&pc).unwrap();
+  assert!(text.contains("Libs.private: -lfoo -lm"), "{text}");
+  assert!(!text.contains("-O2"), "{text}");
+}
+
+#[test]
+fn pc_prefix_pins_an_install_location() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("pc_prefix");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name greet
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  generate_pc {
+    prefix "/opt/greet"
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("greet.c"),
+    "int greet(void) { return 42; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  let pc = dir
+    .join("lib")
+    .join("default")
+    .join("pkgconfig")
+    .join("greet.pc");
+  let text = fs::read_to_string(&pc).unwrap();
+  assert!(text.contains("prefix=/opt/greet"), "{text}");
+  assert!(text.contains("libdir=${prefix}/lib"), "{text}");
+}
+
+#[test]
+fn pkg_config_requires_private_lists_declared_packages() {
+  if !have_cc() || !pkg_config_has("zlib") {
+    return;
+  }
+  let base = tmp("pc_requires");
+  write(
+    &base.join("dep").join("conjure.kdl"),
+    r#"project {
+  name dep
+  language c
+  type library
+  link static
+  compile { standard c11 }
+}
+"#,
+  );
+  write(
+    &base.join("dep").join("src").join("dep.c"),
+    "int dep(void) { return 1; }\n",
+  );
+  write(
+    &base.join("dep").join("src").join("dep.c"),
+    "int dep(void) { return 1; }\n",
+  );
+
+  let app = base.join("app");
+  write(
+    &app.join("conjure.kdl"),
+    r#"project {
+  name app
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  dependencies {
+    dep {
+      local "../dep"
+      pkg_config "zlib"
+    }
+  }
+}
+"#,
+  );
+  // Static library: never links, so an unresolved dep() is fine.
+  write(
+    &app.join("src").join("app.c"),
+    "int dep(void);\nint app(void) { return dep(); }\n",
+  );
+
+  conjure(&app, &["build"]);
+  let pc = app
+    .join("lib")
+    .join("default")
+    .join("pkgconfig")
+    .join("app.pc");
+  let text = fs::read_to_string(&pc).unwrap();
+  assert!(text.contains("Requires.private: zlib"), "{text}");
+  assert!(!text.contains("-lz"), "{text}");
+}

@@ -19,7 +19,8 @@
 /***********************************************************************/
 
 use super::{
-  proj_parse::{Compile, Flags, Project},
+  deps,
+  proj_parse::{Compile, Flags, GeneratePc, Project},
   toolchain::{self, Toolchain},
   ui::{StepStatus, Ui},
 };
@@ -128,31 +129,46 @@ fn write_pkg_config(
   let libdir = lib.parent().expect("library path has a parent");
   let pc_dir = libdir.join("pkgconfig");
 
-  let depth = pc_dir
-    .strip_prefix(root)
-    .map(|p| p.components().count())
-    .unwrap_or(0);
-  let prefix = format!("${{pcfiledir}}/{}", "../".repeat(depth));
-  let prefix = prefix.trim_end_matches('/');
+  let pc = project.generate_pc.as_ref().and_then(GeneratePc::options);
+  let output_lib = project
+    .output
+    .as_ref()
+    .and_then(|o| o.lib.as_deref())
+    .unwrap_or("lib");
+
+  let (prefix, libdir_line) = match pc.and_then(|o| o.prefix.clone()) {
+    Some(prefix) => (prefix, format!("libdir=${{prefix}}/{output_lib}")),
+    None => {
+      let depth = pc_dir
+        .strip_prefix(root)
+        .map(|p| p.components().count())
+        .unwrap_or(0);
+      let prefix = format!("${{pcfiledir}}/{}", "../".repeat(depth));
+      let prefix = prefix.trim_end_matches('/').to_string();
+      let line = match libdir.strip_prefix(root) {
+        Ok(rel) => format!("libdir=${{prefix}}/{}", rel.display()),
+        Err(_) => format!("libdir={}", libdir.display()),
+      };
+      (prefix, line)
+    }
+  };
 
   let artifact = project.artifact_name();
   let mut out = String::new();
   out.push_str(&format!("prefix={prefix}\n"));
-  match libdir.strip_prefix(root) {
-    Ok(rel) => out.push_str(&format!("libdir=${{prefix}}/{}\n", rel.display())),
-    Err(_) => out.push_str(&format!("libdir={}\n", libdir.display())),
-  }
+  out.push_str(&format!("{libdir_line}\n"));
   out.push_str(&format!("Name: {}\n", project.name));
   out.push_str(&format!(
     "Description: {}\n",
-    project
-      .description
-      .as_deref()
+    pc.and_then(|o| o.description.as_deref())
+      .or(project.description.as_deref())
       .unwrap_or(project.name.as_str())
   ));
   out.push_str(&format!(
     "Version: {}\n",
-    project.version.as_deref().unwrap_or("0.0.0")
+    pc.and_then(|o| o.version.as_deref())
+      .or(project.version.as_deref())
+      .unwrap_or("0.0.0")
   ));
 
   let include = project
@@ -178,12 +194,39 @@ fn write_pkg_config(
 
   out.push_str(&format!("Libs: -L${{libdir}} -l{artifact}\n"));
 
-  if !inputs.libs.is_empty() {
-    let private: Vec<String> = inputs
-      .libs
+  // Packages that ship .pc files are referenced by name so pkg-config resolves
+  // them (and their closure); their flattened -l tokens in `extra_libs` are
+  // dropped in that case.
+  let mut requires: Vec<String> =
+    pc.and_then(|o| o.requires.clone()).unwrap_or_default();
+  if let Some(deps) = &project.dependencies {
+    requires.extend(
+      deps
+        .values()
+        .filter_map(|d| d.pkg_config.as_ref())
+        .flatten()
+        .cloned(),
+    );
+  }
+  requires.sort();
+  requires.dedup();
+  if !requires.is_empty() {
+    out.push_str(&format!("Requires.private: {}\n", requires.join(" ")));
+  }
+
+  let mut private: Vec<String> = vec![];
+  if requires.is_empty() {
+    private.extend(inputs.extra_libs.iter().cloned());
+  }
+  private.extend(
+    inputs
+      .ld_flags
       .iter()
-      .map(|p| p.display().to_string())
-      .collect();
+      .filter(|f| deps::is_link_flag(f))
+      .cloned(),
+  );
+  private.extend(inputs.libs.iter().map(|p| p.display().to_string()));
+  if !private.is_empty() {
     out.push_str(&format!("Libs.private: {}\n", private.join(" ")));
   }
 
@@ -552,7 +595,7 @@ pub fn produce(
         format!("Built {}", lib.display()),
       )?;
 
-      if project.generate_pc.unwrap_or(true) {
+      if project.generate_pc.as_ref().is_none_or(|g| g.enabled()) {
         write_pkg_config(project, root, &lib, inputs)?;
       }
     } else {
@@ -574,7 +617,7 @@ pub fn produce(
         format!("Built {}", lib.display()),
       )?;
 
-      if project.generate_pc.unwrap_or(true) {
+      if project.generate_pc.as_ref().is_none_or(|g| g.enabled()) {
         write_pkg_config(project, root, &lib, inputs)?;
       }
     }
@@ -599,7 +642,7 @@ pub fn produce(
       format!("Built {}", bin.display()),
     )?;
 
-    if project.generate_pc == Some(true) {
+    if project.generate_pc.as_ref().is_some_and(|g| g.enabled()) {
       ui.println(
         Some(&StepStatus::Info),
         format!(

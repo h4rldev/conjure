@@ -30,7 +30,7 @@ const SECTION_COMMENTS: &[(&str, &str)] = &[
   ),
   (
     "profiles",
-    "build profiles: `conjure as <name> <subcommand>`, e.g. `conjure as release build`\n  profile_name {\n    extends \"base\" \"other\"  // inherit these profiles first, in order\n    type library               // type, link, cc, linker, standard, arch: scalar overrides\n    link static\n    artifact \"foo-debug\"       // base name of the built artifact; default = project name\n    generate_pc #false         // write a pkg-config .pc for a library; default = project's\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n    tests { }                  // profile-specific tests, merged over the top-level set\n  }",
+    "build profiles: `conjure as <name> <subcommand>`, e.g. `conjure as release build`\n  profile_name {\n    extends \"base\" \"other\"  // inherit these profiles first, in order\n    type library               // type, link, cc, linker, standard, arch: scalar overrides\n    link static\n    artifact \"foo-debug\"       // base name of the built artifact; default = project name\n    generate_pc #false         // .pc for a library; or { prefix \"...\" requires \"...\" }\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n    tests { }                  // profile-specific tests, merged over the top-level set\n  }",
   ),
   (
     "siblings",
