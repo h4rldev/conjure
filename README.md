@@ -21,7 +21,7 @@ replacing them.
 - Dependencies from local paths or git remotes (Codeberg, GitHub, Bitbucket, or
   any URL), pinned in a lockfile and cached per project scope.
 - Build-system interop: Make, CMake, Autotools, Meson, Ninja, Xmake, Just, a
-  free-form command, or Conjure itself (`build: conjure`).
+  free-form command, or Conjure itself (`build conjure`).
 - Toolchain support for GCC/Clang and every GCC-cli-compatible compiler
   (including cross compilers, `zig cc`, `tcc`, MinGW-w64), plus MSVC (`cl` /
   `clang-cl`); shared libraries emit import libraries on MSVC.
