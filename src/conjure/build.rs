@@ -172,6 +172,7 @@ fn test_profile(p: Profile) -> Profile {
     link: None,
     src: None,
     tests: None,
+    artifact: None,
     ..p.clone()
   }
 }

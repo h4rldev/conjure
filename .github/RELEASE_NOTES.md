@@ -1,3 +1,15 @@
+# v0.3.3
+
+Highlights since 0.3.2.
+
+### Override artifact names per profile and project
+
+`artifact` in a profile overrides the project's final artifact, i.e the name of the library or binary built, so `artifact "my-arti
+fact"` in a profile named `debug` will produce `my-artifact`.
+
+This can be scoped globally, so if you want a project called `proj` have all artifacts to be `project`, its simply a single line 
+change in artifact field.
+
 # v0.3.0
 
 Highlights since 0.2.0.

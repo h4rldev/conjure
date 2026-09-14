@@ -335,7 +335,7 @@ fn link_binary(
   if target.symlink {
     symlink_bin(
       target.out,
-      &target.root.join(binary_file_name(&project.name)),
+      &target.root.join(binary_file_name(project.artifact_name())),
     )?;
   }
 
@@ -392,7 +392,7 @@ pub fn binary_path(
   }
   out_dir
     .join(profile_name)
-    .join(binary_file_name(&project.name))
+    .join(binary_file_name(project.artifact_name()))
 }
 
 /// The exact library path [`produce`] writes, honoring `output.lib`. The archive
@@ -414,10 +414,11 @@ pub fn library_path(
   let out_dir = out_dir.join(profile_name);
   if project.is_library() {
     if project.want_static() {
-      out_dir
-        .join(project_toolchain(project).static_archive_name(&project.name))
+      out_dir.join(
+        project_toolchain(project).static_archive_name(project.artifact_name()),
+      )
     } else {
-      out_dir.join(shared_file_name(&project.name))
+      out_dir.join(shared_file_name(project.artifact_name()))
     }
   } else {
     unreachable!("library_path called on a non-library project")

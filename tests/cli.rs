@@ -1258,3 +1258,39 @@ fn test_targets_inherit_symlink_binaries() {
   conjure(&dir, &["test"]);
   assert!(link.symlink_metadata().is_ok());
 }
+
+#[test]
+fn profile_artifact_name_changes_the_library_file() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("artifact_name");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name greet
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  profiles {
+    debug {
+      artifact "greet-debug"
+    }
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("greet.c"),
+    "int greet(void) { return 42; }\n",
+  );
+
+  conjure(&dir, &["build", "-p", "debug"]);
+  let archive = if cfg!(target_env = "msvc") {
+    "greet-debug.lib"
+  } else {
+    "libgreet-debug.a"
+  };
+  assert!(dir.join("lib").join("debug").join(archive).is_file());
+}

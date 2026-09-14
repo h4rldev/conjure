@@ -397,6 +397,8 @@ pub struct Profile {
   #[serde(default)]
   pub link: Option<Linkage>,
   #[serde(default)]
+  pub artifact: Option<String>,
+  #[serde(default)]
   pub cc: Option<String>,
   #[serde(default)]
   pub linker: Option<String>,
@@ -504,6 +506,7 @@ where
 ///   language: string (matches any known form of C or C++ such as C, C++, Cpp, etc.)
 ///   type: string (binary | library)
 ///   link: string (dynamic | static; default dynamic)
+///   artifact: string (name of the artifact; defaults to name)
 ///   license: string
 ///   authors: [string]
 ///   description: string
@@ -534,7 +537,7 @@ where
 ///
 ///   profiles {
 ///     name: string {
-///       type, link, cc, linker, standard, arch: scalar overrides
+///       type, link, cc, linker, standard, arch, artifact: scalar overrides
 ///       c_flags, ld_flags, src, include: [string] (preface with replace to replace the base)
 ///       dependencies: same shape as the top-level dependencies
 ///     }
@@ -554,6 +557,7 @@ where
 ///       ref: string (branch, tag, or commit to pin; default tracks the default branch)
 ///     }
 ///   }
+///
 ///   output {
 ///     bin: string (directory for binaries; default "bin")
 ///     lib: string (directory for libraries; default "lib")
@@ -573,6 +577,9 @@ pub struct Project {
 
   #[serde(default, deserialize_with = "de_linkage")]
   pub link: Linkage,
+
+  #[serde(default)]
+  pub artifact: Option<String>,
 
   #[serde(default)]
   pub version: Option<String>,
@@ -612,6 +619,7 @@ impl Default for Project {
       language: Language::C,
       ty: ProjectType::Binary,
       link: Linkage::Dynamic,
+      artifact: None,
       version: None,
       license: None,
       authors: None,
@@ -663,6 +671,11 @@ impl Project {
     if let Some(link) = p.link {
       out.link = link;
     }
+
+    if let Some(artifact) = &p.artifact {
+      out.artifact = Some(artifact.clone());
+    }
+
     out.compile = Some(out.compile.clone().unwrap_or_default().with_profile(p));
     if let Some(deps) = &p.dependencies {
       let merged = out.dependencies.get_or_insert_with(Default::default);
@@ -681,6 +694,15 @@ impl Project {
     out
   }
 
+  /// The artifact base name: `artifact` if set, else the project `name`.
+  pub fn artifact_name(&self) -> &str {
+    self
+      .artifact
+      .as_deref()
+      .filter(|s| !s.is_empty())
+      .unwrap_or(&self.name)
+  }
+
   /// Parse and validate a manifest.      ld_flags -lxkbcommon -lxkbcommon-x11 -lxcb -lxcb-cursor -lxcb-icccm -lxcb-randr -lbread-x11-release -lhtils -lvulkan -ldl
   pub fn from_str(input: &str) -> Result<Self, Error> {
     let project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
@@ -689,6 +711,23 @@ impl Project {
         dep.validate().map_err(|e| {
           Error::Validate(miette::miette!("dependency `{name}`: {e}"))
         })?;
+      }
+    }
+
+    if let Some(a) = &project.artifact
+      && (a.is_empty() || a.contains(['/', '\\']))
+    {
+      return Err(Error::Validate(miette::miette!(
+        "invalid artifact name `{a}`: must be a plain file name"
+      )));
+    }
+    for (name, profile) in project.profiles.iter().flatten() {
+      if let Some(a) = &profile.artifact
+        && (a.is_empty() || a.contains(['/', '\\']))
+      {
+        return Err(Error::Validate(miette::miette!(
+          "invalid artifact name `{a}` in profile `{name}`: must be a plain file name"
+        )));
       }
     }
 
@@ -1005,5 +1044,21 @@ mod tests {
     ] {
       assert!(Project::from_str(src).is_err(), "should reject: {src}");
     }
+  }
+
+  #[test]
+  fn profile_artifact_renames_the_artifact() {
+    let p = parse(
+      "project {\n  name t\n  language c\n  type library\n  link static\n  profiles {\n    debug {\n      artifact \"t-debug\"\n    }\n  }\n}",
+    );
+    let prof = p.profile("debug").unwrap().1;
+    assert_eq!(p.with_profile(Some(prof)).artifact_name(), "t-debug");
+    assert_eq!(p.artifact_name(), "t");
+  }
+
+  #[test]
+  fn artifact_names_reject_path_separators() {
+    let src = "project {\n  name t\n  language c\n  type binary\n  profiles {\n    debug {\n      artifact \"../oops\"\n    }\n  }\n}";
+    assert!(Project::from_str(src).is_err());
   }
 }
