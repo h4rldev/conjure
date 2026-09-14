@@ -1030,7 +1030,8 @@ fn test_targets_link_the_parent_library() {
 #else
 #define EXPORT
 #endif
-EXPORT int core(void) { return 42; }\n"#,
+EXPORT int core(void) { return 42; }
+"#,
   );
   write(&dir.join("src").join("core.h"), "int core(void);\n");
   write(
@@ -1080,7 +1081,8 @@ fn profile_tests_only_build_under_their_profile() {
 #else
 #define EXPORT
 #endif
-EXPORT int core(void) { return 42; }\n"#,
+EXPORT int core(void) { return 42; }
+"#,
   );
   write(&dir.join("src/core.h"), "int core(void);\n");
   write(
