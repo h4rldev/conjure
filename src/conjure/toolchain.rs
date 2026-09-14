@@ -1246,6 +1246,10 @@ fn msvc_depfile_json() {
   let text = r#"{ "Version": "1.2", "Data": { "Source": "a.c", "Includes": ["a.h", "C:\\inc\\b.h"] } }"#;
   assert_eq!(
     Microsoft::default().parse_depfile(text),
-    vec![PathBuf::from("a.h"), PathBuf::from("C:\\inc\\b.h")]
+    vec![
+      PathBuf::from("a.c"),
+      PathBuf::from("a.h"),
+      PathBuf::from("C:\\inc\\b.h"),
+    ]
   );
 }
