@@ -12,7 +12,8 @@
 use super::{
   build, compile, git, lock, proj,
   proj_parse::{
-    self, Arch, Compile, Flags, Linkage, Profile, Project, ProjectType, slugify,
+    self, Arch, Compile, Flags, Linkage, Output, Profile, Project, ProjectType,
+    slugify,
   },
   proj_write::fix_braces,
   ui::{StepStatus, Ui},
@@ -431,6 +432,7 @@ fn build_project(
     ])),
     dependencies: Some(HashMap::new()),
     tests: Some(HashMap::new()),
+    output: Some(Output::default()),
     ..Default::default()
   }
 }
