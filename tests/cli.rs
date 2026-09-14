@@ -1024,7 +1024,13 @@ fn test_targets_link_the_parent_library() {
   write(&dir.join("conjure.kdl"), manifest);
   write(
     &dir.join("src").join("core.c"),
-    "int core(void) { return 42; }\n",
+    r#"
+#if defined(_MSC_VER)
+#define EXPORT __declspec(dllexport)
+#else
+#define EXPORT
+#endif
+EXPORT int core(void) { return 42; }\n"#,
   );
   write(&dir.join("src").join("core.h"), "int core(void);\n");
   write(
@@ -1066,7 +1072,16 @@ fn profile_tests_only_build_under_their_profile() {
 "#;
   write(&dir.join("conjure.kdl"), manifest);
   write(&dir.join("src/main.c"), "int main(void) { return 0; }\n");
-  write(&dir.join("src/lib.c"), "int core(void) { return 42; }\n");
+  write(
+    &dir.join("src/lib.c"),
+    r#"
+#if defined(_MSC_VER)
+#define EXPORT __declspec(dllexport)
+#else
+#define EXPORT
+#endif
+EXPORT int core(void) { return 42; }\n"#,
+  );
   write(&dir.join("src/core.h"), "int core(void);\n");
   write(
     &dir.join("src").join("test").join("unit.c"),

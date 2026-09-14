@@ -693,15 +693,21 @@ impl Driver for Microsoft {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
       return Vec::new();
     };
-    v["Data"]["Includes"]
-      .as_array()
-      .map(|a| {
-        a.iter()
+    let data = &v["Data"];
+    let mut out: Vec<PathBuf> = data["Source"]
+      .as_str()
+      .map(PathBuf::from)
+      .into_iter()
+      .collect();
+    if let Some(includes) = data["Includes"].as_array() {
+      out.extend(
+        includes
+          .iter()
           .filter_map(|x| x.as_str())
-          .map(PathBuf::from)
-          .collect()
-      })
-      .unwrap_or_default()
+          .map(PathBuf::from),
+      );
+    }
+    out
   }
 
   fn static_archive_name(&self, base: &str) -> String {
