@@ -1,3 +1,21 @@
+# v0.4.2
+
+Highlights since 0.4.1.
+
+### Fix: a single package in `generate_pc { requires ... }`
+
+`generate_pc { requires "zlib" }` now parses. A lone package argument was
+previously rejected, since only two or more worked; the untagged `generate_pc`
+block flattened a single argument into a scalar that the list field could not
+read. The manifest schema and the scaffolded `profiles` comment now describe the
+block form as well.
+
+### Smaller
+
+- Parsing tests cover the single-element form of the multi-valued manifest
+  fields, so a lone argument cannot silently fail again.
+
+
 # v0.4.1
 
 Highlights since 0.4.0.
