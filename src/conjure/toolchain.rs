@@ -15,7 +15,12 @@
 
 use super::proj_parse::{Arch, Compile, Language};
 use miette::{Context, IntoDiagnostic, Result};
-use std::{ffi::OsString, path::PathBuf, process::Command, sync::OnceLock};
+use std::{
+  ffi::OsString,
+  path::{Path, PathBuf},
+  process::Command,
+  sync::OnceLock,
+};
 
 /***********************************************************************/
 
@@ -59,6 +64,12 @@ pub trait Driver {
   ) -> Result<(Vec<String>, Vec<String>)>;
   fn default_linker(&self, cc: &[String]) -> Result<String>;
   fn raw_link_args(&self, cc: &[String], job: &LinkJob) -> Result<Vec<String>>;
+
+  /// The transient depfile for `obj` and the flags that make the compiler write
+  /// it (this object's header dependencies).
+  fn depfile(&self, obj: &str) -> (String, Vec<String>);
+  /// Parse a depfile's text into the file paths it names.
+  fn parse_depfile(&self, text: &str) -> Vec<PathBuf>;
 
   // Archive
   fn static_archive_name(&self, base: &str) -> String;
@@ -365,6 +376,41 @@ impl Driver for Gnu {
     Ok(argv)
   }
 
+  fn depfile(&self, obj: &str) -> (String, Vec<String>) {
+    let dep = Path::new(obj).with_extension("d").display().to_string();
+    (dep.clone(), vec!["-MMD".into(), "-MF".into(), dep])
+  }
+
+  fn parse_depfile(&self, text: &str) -> Vec<PathBuf> {
+    // Makefile syntax: `target: dep dep \` with continuations; spaces inside a
+    // path are `\ `-escaped. `": "` avoids a Windows drive-letter colon.
+    let joined = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let deps = joined
+      .split_once(": ")
+      .or_else(|| joined.split_once(':'))
+      .map(|(_, d)| d)
+      .unwrap_or("");
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = deps.chars().peekable();
+    while let Some(c) = chars.next() {
+      if c == '\\' && chars.peek() == Some(&' ') {
+        cur.push(' ');
+        chars.next();
+      } else if c.is_whitespace() {
+        if !cur.is_empty() {
+          out.push(PathBuf::from(std::mem::take(&mut cur)));
+        }
+      } else {
+        cur.push(c);
+      }
+    }
+    if !cur.is_empty() {
+      out.push(PathBuf::from(cur));
+    }
+    out
+  }
+
   fn static_archive_name(&self, base: &str) -> String {
     format!("lib{base}.a")
   }
@@ -569,8 +615,17 @@ impl Driver for Microsoft {
     argv.extend(job.libs.iter().filter_map(|p| p.to_str().map(String::from)));
     argv.extend(job.extra_libs.iter().cloned());
     argv.push(format!("/Fe:{}", job.out));
-    if !job.flags.is_empty() {
+    let implib = job.shared.then(|| {
+      Path::new(job.out)
+        .with_extension("lib")
+        .display()
+        .to_string()
+    });
+    if implib.is_some() || !job.flags.is_empty() {
       argv.push("/link".into());
+      if let Some(implib) = implib {
+        argv.push(format!("/IMPLIB:{implib}"));
+      }
       argv.extend(job.flags.iter().cloned());
     }
 
@@ -619,8 +674,34 @@ impl Driver for Microsoft {
     argv.extend(job.libs.iter().filter_map(|p| p.to_str().map(String::from)));
     argv.extend(job.extra_libs.iter().cloned());
     argv.push(format!("/OUT:{}", job.out));
+    if job.shared {
+      argv.push(format!(
+        "/IMPLIB:{}",
+        Path::new(job.out).with_extension("lib").display()
+      ));
+    }
     argv.extend(job.flags.iter().cloned());
     Ok(argv)
+  }
+
+  fn depfile(&self, obj: &str) -> (String, Vec<String>) {
+    let dep = format!("{obj}.json");
+    (dep.clone(), vec!["/sourceDependencies".into(), dep])
+  }
+
+  fn parse_depfile(&self, text: &str) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+      return Vec::new();
+    };
+    v["Data"]["Includes"]
+      .as_array()
+      .map(|a| {
+        a.iter()
+          .filter_map(|x| x.as_str())
+          .map(PathBuf::from)
+          .collect()
+      })
+      .unwrap_or_default()
   }
 
   fn static_archive_name(&self, base: &str) -> String {
@@ -696,6 +777,13 @@ impl Toolchain {
 
   pub fn raw_link_args(&self, job: &LinkJob) -> Result<Vec<String>> {
     self.driver.raw_link_args(self.cc.as_slice(), job)
+  }
+
+  pub fn depfile(&self, obj: &str) -> (String, Vec<String>) {
+    self.driver.depfile(obj)
+  }
+  pub fn parse_depfile(&self, text: &str) -> Vec<PathBuf> {
+    self.driver.parse_depfile(text)
   }
 
   pub fn static_archive_name(&self, base: &str) -> String {
@@ -1083,9 +1171,11 @@ gcc version 15.3.0\n\
       flags: &empty,
       ..job
     };
+
     let argv = ms(Arch::X86_64).driver_link_args(&job);
     assert!(argv.contains(&"/LD".to_string()));
-    assert!(!argv.contains(&"/link".to_string()));
+    assert!(argv.contains(&"/link".to_string()));
+    assert!(argv.contains(&"/IMPLIB:prog.lib".to_string()));
 
     let raw = ms(Arch::X86_64).raw_link_args(&prefix, &job).unwrap();
     assert_eq!(raw[0], "cl");
@@ -1130,4 +1220,26 @@ gcc version 15.3.0\n\
   fn default_compiler_is_msvc_when_visual_studio_is_present() {
     assert_eq!(default_compiler(&Language::C), "cl");
   }
+}
+
+#[test]
+fn gnu_depfile_roundtrip() {
+  let text = "a.o: src/a.c src/b.h \\\n  /usr/include/stdio.h\n";
+  assert_eq!(
+    Gnu::default().parse_depfile(text),
+    vec![
+      PathBuf::from("src/a.c"),
+      PathBuf::from("src/b.h"),
+      PathBuf::from("/usr/include/stdio.h"),
+    ]
+  );
+}
+
+#[test]
+fn msvc_depfile_json() {
+  let text = r#"{ "Version": "1.2", "Data": { "Source": "a.c", "Includes": ["a.h", "C:\\inc\\b.h"] } }"#;
+  assert_eq!(
+    Microsoft::default().parse_depfile(text),
+    vec![PathBuf::from("a.h"), PathBuf::from("C:\\inc\\b.h")]
+  );
 }

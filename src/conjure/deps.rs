@@ -551,6 +551,7 @@ pub fn local_dep_fingerprint(
     &dep_dir,
     out_profile,
     &commits,
+    &[],
     cache,
   )
 }
@@ -608,7 +609,7 @@ fn build_conjure_dep<'a>(
   build::build_ctx(&child_ctx, ui)?;
   let out_profile = child_profile.map_or("default", |(n, _)| n);
   let scoped = link::output_scoped(&effective, &dep_dir, ctx.root);
-  Ok(link::library_path(
+  Ok(link::link_library_path(
     &effective,
     ctx.root,
     out_profile,
@@ -894,11 +895,18 @@ pub fn resolve_pkg_config(
         cmd.arg("--static");
       }
     }
-    let out = cmd.args(pkgs).output().into_diagnostic()?;
+
+    let out = cmd.args(pkgs).output().map_err(|source| {
+      miette::miette!(
+        help = "Install pkg-config, or remove the `pkg_config` field from dependency `{name}`",
+        "Failed to run pkg-config for dependency `{name}` ({pkgs:?}): {source}"
+      )
+    })?;
 
     miette::ensure!(
       out.status.success(),
-      "pkg-config failed for `{name}` ({pkgs:?}): {}",
+      help = "Make sure `{pkgs:?}` is installed and on PKG_CONFIG_PATH",
+      "pkg-config failed for dependency `{name}` ({pkgs:?}): {}",
       String::from_utf8_lossy(&out.stderr),
     );
 

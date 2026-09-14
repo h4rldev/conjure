@@ -28,7 +28,7 @@ use super::{
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
   fs,
   hash::{DefaultHasher, Hash, Hasher},
   path::{Path, PathBuf},
@@ -97,23 +97,26 @@ fn hash_file(path: &Path) -> Result<u64> {
   Ok(h.finish())
 }
 
-/// Stable `path:hash` lines for `paths`, sorted so the result does not depend on
-/// directory-walk order. `cache` supplies hashes for files whose size and mtime
-/// are unchanged, so only newly-touched files are read.
-fn file_fingerprint(
+fn file_fingerprint_inner(
   cache: &mut FileCache,
   paths: &[PathBuf],
+  skip_missing: bool,
 ) -> Result<Vec<String>> {
   let mut out = Vec::with_capacity(paths.len());
   for path in paths {
-    let md = fs::metadata(path).map_err(|source| ReadPath {
-      path: path.to_path_buf(),
-      source,
-    })?;
-
+    let md = if skip_missing {
+      match fs::metadata(path) {
+        Ok(md) => md,
+        Err(_) => continue,
+      }
+    } else {
+      fs::metadata(path).map_err(|source| ReadPath {
+        path: path.to_path_buf(),
+        source,
+      })?
+    };
     let size = md.len();
     let mtime = mtime_nanos(&md);
-
     let hash = match cache.files.get(path) {
       Some(entry) if entry.size == size && entry.mtime == mtime => entry.hash,
       _ => {
@@ -124,10 +127,29 @@ fn file_fingerprint(
         hash
       }
     };
-    out.push(format!("{}:{hash:016x}", path.display()));
+    out.push(format!("file:{}:{hash:016x}", path.display()));
   }
   out.sort();
   Ok(out)
+}
+
+/// Like [`file_fingerprint`], but a path that no longer exists is skipped
+/// instead of erroring: a depfile can name a since-deleted header.
+fn file_fingerprint_opt(
+  cache: &mut FileCache,
+  paths: &[PathBuf],
+) -> Result<Vec<String>> {
+  file_fingerprint_inner(cache, paths, true)
+}
+
+/// Stable `path:hash` lines for `paths`, sorted so the result does not depend on
+/// directory-walk order. `cache` supplies hashes for files whose size and mtime
+/// are unchanged, so only newly-touched files are read.
+fn file_fingerprint(
+  cache: &mut FileCache,
+  paths: &[PathBuf],
+) -> Result<Vec<String>> {
+  file_fingerprint_inner(cache, paths, false)
 }
 
 /// Content fingerprint of a whole directory tree, for a dep whose external
@@ -139,6 +161,28 @@ pub fn dir_fingerprint(dir: &Path, cache: &mut FileCache) -> Result<String> {
   Ok(file_fingerprint(cache, &files)?.join(","))
 }
 
+/// Split a fingerprint into its non-file items and its `file:path:hash`
+/// entries, so a build can tell which sources changed instead of rebuilding
+/// everything. The returned base is the non-file items rejoined, so two
+/// fingerprints have equal bases if their non-file inputs match.
+pub fn split(fp: &str) -> (String, BTreeMap<PathBuf, u64>) {
+  let mut base: Vec<&str> = vec![];
+  let mut files = BTreeMap::new();
+  for item in fp.split('|') {
+    let parsed = item.strip_prefix("file:").and_then(|rest| {
+      let (path, hash) = rest.rsplit_once(':')?;
+      Some((PathBuf::from(path), u64::from_str_radix(hash, 16).ok()?))
+    });
+    match parsed {
+      Some((path, hash)) => {
+        files.insert(path, hash);
+      }
+      None => base.push(item),
+    }
+  }
+  (base.join("|"), files)
+}
+
 /// The fingerprint of `project` built in `dir` under `profile_name`, with the
 /// given pinned dependency commits. `cache` carries the previous run's file
 /// hashes so unchanged files are not re-read.
@@ -147,6 +191,7 @@ pub fn fingerprint(
   dir: &Path,
   profile_name: &str,
   dep_commits: &[&str],
+  pkg_cflags: &[String],
   cache: &mut FileCache,
 ) -> Result<String> {
   let exts = match project.language {
@@ -188,6 +233,8 @@ pub fn fingerprint(
     items.push(format!("{:?}", f));
   }
 
+  items.extend(pkg_cflags.iter().filter(|s| !s.is_empty()).cloned());
+
   if let Some(f) = &compile.ld_flags {
     items.push(format!("{:?}", f));
   }
@@ -211,6 +258,9 @@ pub fn fingerprint(
     }
   }
 
+  let dep_files = super::incremental::DepGraph::load(dir, profile_name).files();
+  items.extend(file_fingerprint_opt(cache, &dep_files)?);
+
   if let Some(deps) = &project.dependencies {
     let mut entries: Vec<(&String, &Dependency)> = deps.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -233,11 +283,11 @@ pub fn fingerprint(
 
 #[cfg(test)]
 mod tests {
-  use super::{FileCache, fingerprint};
+  use super::{FileCache, fingerprint, split};
   use crate::conjure::proj_parse::{
     Arch, Compile, Dependency, Flags, Language, Project,
   };
-  use std::collections::HashMap;
+  use std::{collections::HashMap, path::Path};
 
   fn local_dep(path: &str) -> Dependency {
     Dependency {
@@ -283,9 +333,9 @@ mod tests {
     b.dependencies = Some(m2);
 
     assert_eq!(
-      fingerprint(&a, &base, "default", &[], &mut FileCache::default())
+      fingerprint(&a, &base, "default", &[], &[], &mut FileCache::default())
         .unwrap(),
-      fingerprint(&b, &base, "default", &[], &mut FileCache::default())
+      fingerprint(&b, &base, "default", &[], &[], &mut FileCache::default())
         .unwrap()
     );
 
@@ -310,19 +360,19 @@ mod tests {
 
     let mut cache = FileCache::default();
     let first =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
     assert_eq!(cache.files.len(), 1, "one source cached");
 
     // A second run reuses the cached hash and yields the same fingerprint.
     let second =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
     assert_eq!(first, second);
 
     // Editing the content changes the fingerprint. Use a different length so
     // this does not depend on mtime granularity (coarse on some filesystems).
     std::fs::write(src.join("main.c"), "int main(void){return 42;}").unwrap();
     let third =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
     assert_ne!(first, third);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -348,18 +398,18 @@ mod tests {
 
     let mut cache = FileCache::default();
     let first =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
 
     // A file the project doesn't list changes nothing.
     std::fs::write(base.join("b.c"), "int b = 1;").unwrap();
     let second =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
     assert_eq!(first, second);
 
     // Editing the listed file invalidates.
     std::fs::write(base.join("a.c"), "int a = 1;").unwrap();
     let third =
-      fingerprint(&project, &base, "default", &[], &mut cache).unwrap();
+      fingerprint(&project, &base, "default", &[], &[], &mut cache).unwrap();
     assert_ne!(first, third);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -393,7 +443,7 @@ mod tests {
       ..Default::default()
     };
     let fp =
-      fingerprint(&full, &base, "default", &[], &mut FileCache::default())
+      fingerprint(&full, &base, "default", &[], &[], &mut FileCache::default())
         .unwrap();
     assert!(!fp.is_empty());
 
@@ -404,8 +454,55 @@ mod tests {
       compile: Some(Compile::default()),
       ..Default::default()
     };
-    fingerprint(&bare, &base, "default", &[], &mut FileCache::default())
+    fingerprint(&bare, &base, "default", &[], &[], &mut FileCache::default())
       .unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn split_separates_file_lines() {
+    let fp = "default|cc|file:/a/x.c:00000000000000ff|file:/a/y.c:00000000000000aa|Append([\"-O2\"])";
+    let (base, files) = split(fp);
+    assert_eq!(base, "default|cc|Append([\"-O2\"])");
+    assert_eq!(files.get(Path::new("/a/x.c")), Some(&0xff));
+    assert_eq!(files.get(Path::new("/a/y.c")), Some(&0xaa));
+  }
+
+  #[test]
+  fn pkg_cflags_change_the_fingerprint() {
+    let base = std::env::temp_dir()
+      .join(format!("conjure_fp_pkg_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/main.c"), "").unwrap();
+
+    let project = Project {
+      name: "x".into(),
+      language: Language::C,
+      compile: Some(Default::default()),
+      ..Default::default()
+    };
+
+    let bare = fingerprint(
+      &project,
+      &base,
+      "default",
+      &[],
+      &[],
+      &mut FileCache::default(),
+    )
+    .unwrap();
+    let with_pkg = fingerprint(
+      &project,
+      &base,
+      "default",
+      &[],
+      &["-DX".to_string()],
+      &mut FileCache::default(),
+    )
+    .unwrap();
+
+    assert_ne!(bare, with_pkg);
 
     let _ = std::fs::remove_dir_all(&base);
   }

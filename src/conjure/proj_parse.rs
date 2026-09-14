@@ -14,7 +14,12 @@
 
 use miette::Result;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::Path, string::String};
+use std::{
+  collections::{HashMap, HashSet},
+  fs,
+  path::Path,
+  string::String,
+};
 
 /***********************************************************************/
 
@@ -266,7 +271,10 @@ impl TryFrom<Vec<String>> for Flags {
 
 /// Fold a profile's flags over a base set: `Replace` overrides, otherwise the
 /// lists concatenate.
-fn merge_flags(base: Option<&Flags>, over: Option<&Flags>) -> Option<Flags> {
+pub fn merge_flags(
+  base: Option<&Flags>,
+  over: Option<&Flags>,
+) -> Option<Flags> {
   match over {
     None => base.cloned(),
     Some(Flags::Replace(v)) => Some(Flags::Replace(v.clone())),
@@ -338,6 +346,12 @@ pub struct Sibling {
 pub struct Test {
   #[serde(default)]
   pub src: Option<Flags>,
+  #[serde(default)]
+  pub include: Option<Flags>,
+  #[serde(default)]
+  pub c_flags: Option<Flags>,
+  #[serde(default)]
+  pub ld_flags: Option<Flags>,
 }
 
 #[derive(Deserialize, Default, Clone, Serialize, Debug)]
@@ -398,6 +412,8 @@ pub struct Profile {
   pub link: Option<Linkage>,
   #[serde(default)]
   pub artifact: Option<String>,
+  #[serde(default, deserialize_with = "de_kdl_bool")]
+  pub generate_pc: Option<bool>,
   #[serde(default)]
   pub cc: Option<String>,
   #[serde(default)]
@@ -420,6 +436,79 @@ pub struct Profile {
   pub tests: Option<HashMap<String, Test>>,
   #[serde(default)]
   pub dependencies: Option<HashMap<String, Dependency>>,
+
+  /// Named profiles to inherit from, applied in listed order before this
+  /// profile's own overrides.
+  #[serde(default)]
+  pub extends: Option<Vec<String>>,
+}
+
+impl Profile {
+  fn merge(mut self, other: &Self) -> Profile {
+    self.ty = other.ty.or(self.ty);
+    self.link = other.link.or(self.link);
+    self.cc = other.cc.clone().or(self.cc);
+    self.linker = other.linker.clone().or(self.linker);
+    self.standard = other.standard.clone().or(self.standard);
+    self.arch = other.arch.or(self.arch);
+    self.threads = other.threads.or(self.threads);
+    self.artifact = other.artifact.clone().or(self.artifact);
+    self.generate_pc = other.generate_pc.or(self.generate_pc);
+    self.include = merge_flags(self.include.as_ref(), other.include.as_ref());
+    self.src = merge_flags(self.src.as_ref(), other.src.as_ref());
+    self.c_flags = merge_flags(self.c_flags.as_ref(), other.c_flags.as_ref());
+    self.ld_flags =
+      merge_flags(self.ld_flags.as_ref(), other.ld_flags.as_ref());
+    self.tests = merge_map(self.tests.as_ref(), other.tests.as_ref());
+    self.dependencies =
+      merge_map(self.dependencies.as_ref(), other.dependencies.as_ref());
+    self.extends = None;
+    self
+  }
+}
+
+/// Merge two optional maps, `over` winning on key clashes.
+fn merge_map<V: Clone>(
+  base: Option<&HashMap<String, V>>,
+  over: Option<&HashMap<String, V>>,
+) -> Option<HashMap<String, V>> {
+  if base.is_none() && over.is_none() {
+    return None;
+  }
+  let mut out = base.cloned().unwrap_or_default();
+  if let Some(over) = over {
+    for (k, v) in over {
+      out.insert(k.clone(), v.clone());
+    }
+  }
+  Some(out)
+}
+
+fn collect_profile(
+  name: &str,
+  profiles: &HashMap<String, Profile>,
+  in_progress: &mut HashSet<String>,
+  done: &mut HashSet<String>,
+  order: &mut Vec<Profile>,
+) -> Result<(), Error> {
+  if done.contains(name) {
+    return Ok(());
+  }
+  if !in_progress.insert(name.to_string()) {
+    return Err(Error::Validate(miette::miette!(
+      "profile `{name}` has a cyclic `extends`"
+    )));
+  }
+  let profile = profiles.get(name).ok_or_else(|| {
+    Error::Validate(miette::miette!("profile `{name}` is not defined"))
+  })?;
+  for parent in profile.extends.iter().flatten() {
+    collect_profile(parent, profiles, in_progress, done, order)?;
+  }
+  in_progress.remove(name);
+  done.insert(name.to_string());
+  order.push(profile.clone());
+  Ok(())
 }
 
 /// Lowercase, keep alphanumerics, collapse every other run into a single `-`.
@@ -507,6 +596,7 @@ where
 ///   type: string (binary | library)
 ///   link: string (dynamic | static; default dynamic)
 ///   artifact: string (name of the artifact; defaults to name)
+///   generate_pc: bool (whether to generate a .pc file; default true)
 ///   license: string
 ///   authors: [string]
 ///   description: string
@@ -532,12 +622,15 @@ where
 ///     name {
 ///       src: [string] (source roots for this test binary; the project must be
 ///       `type library` since the test links it)
+///       include: [string] (dirs relative to the dep root, each becomes -I<dep>/<dir>)
+///       c_flags: [string] (c_flags to apply to the test binary)
+///       ld_flags: [string] (ld_flags to apply to the test binary)
 ///     }
 ///   }
 ///
 ///   profiles {
 ///     name: string {
-///       type, link, cc, linker, standard, arch, artifact: scalar overrides
+///       type, link, cc, linker, standard, arch, artifact, generate_pc: scalar overrides
 ///       c_flags, ld_flags, src, include: [string] (preface with replace to replace the base)
 ///       dependencies: same shape as the top-level dependencies
 ///     }
@@ -581,6 +674,9 @@ pub struct Project {
   #[serde(default)]
   pub artifact: Option<String>,
 
+  #[serde(default, deserialize_with = "de_kdl_bool")]
+  pub generate_pc: Option<bool>,
+
   #[serde(default)]
   pub version: Option<String>,
 
@@ -620,6 +716,7 @@ impl Default for Project {
       ty: ProjectType::Binary,
       link: Linkage::Dynamic,
       artifact: None,
+      generate_pc: None,
       version: None,
       license: None,
       authors: None,
@@ -676,6 +773,10 @@ impl Project {
       out.artifact = Some(artifact.clone());
     }
 
+    if let Some(generate_pc) = p.generate_pc {
+      out.generate_pc = Some(generate_pc);
+    }
+
     out.compile = Some(out.compile.clone().unwrap_or_default().with_profile(p));
     if let Some(deps) = &p.dependencies {
       let merged = out.dependencies.get_or_insert_with(Default::default);
@@ -703,9 +804,33 @@ impl Project {
       .unwrap_or(&self.name)
   }
 
+  fn fold_profiles(&mut self) -> Result<(), Error> {
+    let Some(profiles) = self.profiles.clone() else {
+      return Ok(());
+    };
+    let mut folded = HashMap::with_capacity(profiles.len());
+    for name in profiles.keys() {
+      let mut order = Vec::new();
+      collect_profile(
+        name,
+        &profiles,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut order,
+      )?;
+      let mut profile = Profile::default();
+      for parent in &order {
+        profile = profile.merge(parent);
+      }
+      folded.insert(name.clone(), profile);
+    }
+    self.profiles = Some(folded);
+    Ok(())
+  }
+
   /// Parse and validate a manifest.      ld_flags -lxkbcommon -lxkbcommon-x11 -lxcb -lxcb-cursor -lxcb-icccm -lxcb-randr -lbread-x11-release -lhtils -lvulkan -ldl
   pub fn from_str(input: &str) -> Result<Self, Error> {
-    let project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
+    let mut project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
     if let Some(deps) = &project.dependencies {
       for (name, dep) in deps {
         dep.validate().map_err(|e| {
@@ -731,6 +856,7 @@ impl Project {
       }
     }
 
+    project.fold_profiles()?;
     Ok(project)
   }
 
@@ -1060,5 +1186,26 @@ mod tests {
   fn artifact_names_reject_path_separators() {
     let src = "project {\n  name t\n  language c\n  type binary\n  profiles {\n    debug {\n      artifact \"../oops\"\n    }\n  }\n}";
     assert!(Project::from_str(src).is_err());
+  }
+
+  #[test]
+  fn profile_extends_folds_ancestors_in_order() {
+    let p = parse(
+      "project {\n  name t\n  language c\n  type binary\n  profiles {\n    base {\n      c_flags -DBASE\n    }\n    extra {\n      c_flags -DEXTRA\n    }\n    combo {\n      extends \"base\" \"extra\"\n      c_flags -DCOMBO\n    }\n  }\n}",
+    );
+    let combo = p.profile("combo").unwrap().1;
+    assert_eq!(
+      combo.c_flags.as_ref().unwrap().list(),
+      vec!["-DBASE", "-DEXTRA", "-DCOMBO"]
+    );
+  }
+
+  #[test]
+  fn profile_extends_rejects_unknown_and_cycles() {
+    let unknown = "project {\n  name t\n  language c\n  type binary\n  profiles {\n    a {\n      extends \"nope\"\n    }\n  }\n}";
+    assert!(Project::from_str(unknown).is_err());
+
+    let cycle = "project {\n  name t\n  language c\n  type binary\n  profiles {\n    a {\n      extends \"b\"\n    }\n    b {\n      extends \"a\"\n    }\n  }\n}";
+    assert!(Project::from_str(cycle).is_err());
   }
 }

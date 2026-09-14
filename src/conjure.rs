@@ -6,6 +6,7 @@ pub(crate) mod deps;
 pub(crate) mod diag;
 pub(crate) mod fingerprint;
 pub(crate) mod git;
+pub(crate) mod incremental;
 pub(crate) mod link;
 pub(crate) mod lock;
 pub(crate) mod proj;

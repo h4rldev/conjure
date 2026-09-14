@@ -1,3 +1,43 @@
+# v0.4.0
+
+Highlights since 0.3.3.
+
+### Incremental builds
+Sources are compiled individually and tracked by content hash plus their header
+dependencies (from compiler depfiles), so editing one file only recompiles it,
+and editing a header only recompiles the objects that include it. Flags,
+profiles, and dependency changes still rebuild everything, as they must.
+
+### Test targets take their own flags
+`tests` entries now accept `c_flags`, `ld_flags`, and `include`, merged over the
+project's for that target only — so a test can define `-DBUILD_TEST` or add an
+include dir without leaking into the library.
+
+### pkg-config files for libraries
+A `type library` build now writes `<output.lib>/<profile>/pkgconfig/<artifact>.pc`
+(relocatable via `${pcfiledir}`), naming/description/version from the project,
+`Cflags` from `compile.include`, and `Libs`/`Libs.private` from the artifact and
+its dependencies. Opt out with `generate_pc #false`, globally or per profile.
+
+### Profile inheritance
+A profile can inherit from others with `extends "base" "other"`, applied in
+order before its own overrides, so platform × build-mode × sanitizer dimensions
+don't need one profile per combination. Unknown names and cycles are rejected at
+parse time.
+
+### `conjure as` gets real subcommand help
+`conjure as <profile> <subcommand>` now presents the same per-subcommand help as
+the top-level CLI, and `conjure as <profile>` with no subcommand is a clear
+error. Note `--` is no longer accepted before the subcommand: `conjure as
+release build`, not `conjure as release -- build`.
+
+### MSVC shared libraries
+Shared libraries on MSVC now emit an import library (`/IMPLIB`), and consumers
+link it, so a project can link against a shared conjure dependency on MSVC.
+
+### Smaller
+- `conjure new` documents the new `tests`/profile fields.
+
 # v0.3.3
 
 Highlights since 0.3.2.

@@ -12,6 +12,14 @@ use std::{
 const CONJURE: &str = env!("CARGO_BIN_EXE_conjure");
 
 fn tmp(name: &str) -> PathBuf {
+  static USED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+  {
+    let mut used = USED.lock().unwrap();
+    let used = used.get_or_insert_with(Default::default);
+    assert!(used.insert(name.to_string()), "Duplicate tmp name: {name}");
+  }
+
   let base = std::env::var_os("CARGO_TARGET_TMPDIR")
     .map(PathBuf::from)
     .unwrap_or_else(std::env::temp_dir)
@@ -71,17 +79,6 @@ fn shared(name: &str) -> String {
     format!("lib{name}.dylib")
   } else {
     format!("lib{name}.so")
-  }
-}
-
-/// MSVC's linker needs an import library, which conjure doesn't emit for shared
-/// libraries yet, so parent libraries link statically there; gnu/unix link the
-/// `.dll`/`.so` directly.
-fn parent_link() -> &'static str {
-  if cfg!(target_env = "msvc") {
-    "static"
-  } else {
-    "dynamic"
   }
 }
 
@@ -395,7 +392,7 @@ fn profile_places_artifact_under_the_profile() {
   );
   write(&dir.join("src").join("main.c"), MAIN_C);
 
-  conjure(&dir, &["as", "debug", "--", "build"]);
+  conjure(&dir, &["as", "debug", "build"]);
   assert!(dir.join("bin").join("debug").join(exe("hello")).is_file());
 }
 
@@ -1017,15 +1014,14 @@ fn test_targets_link_the_parent_library() {
   name core
   language c
   type library
-  link PARENT_LINK
+  link dynamic
   compile { standard c11 }
   tests {
     unit { src "src/test/unit.c" }
   }
 }
-"#
-  .replace("PARENT_LINK", parent_link());
-  write(&dir.join("conjure.kdl"), &manifest);
+"#;
+  write(&dir.join("conjure.kdl"), manifest);
   write(
     &dir.join("src").join("core.c"),
     "int core(void) { return 42; }\n",
@@ -1062,14 +1058,13 @@ fn profile_tests_only_build_under_their_profile() {
   profiles {
     lib {
       type library
-      link PROFILE_LINK
+      link dynamic 
       tests { unit { src "src/test/unit.c" } }
     }
   }
 }
-"#
-  .replace("PROFILE_LINK", parent_link());
-  write(&dir.join("conjure.kdl"), &manifest);
+"#;
+  write(&dir.join("conjure.kdl"), manifest);
   write(&dir.join("src/main.c"), "int main(void) { return 0; }\n");
   write(&dir.join("src/lib.c"), "int core(void) { return 42; }\n");
   write(&dir.join("src/core.h"), "int core(void);\n");
@@ -1293,4 +1288,340 @@ fn profile_artifact_name_changes_the_library_file() {
     "libgreet-debug.a"
   };
   assert!(dir.join("lib").join("debug").join(archive).is_file());
+}
+
+#[test]
+fn only_changed_sources_recompile() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("incremental");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name inc
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("a.c"),
+    "int a(void) { return 1; }\nint main(void) { return a() - 1; }\n",
+  );
+  write(&dir.join("src").join("b.c"), "int b(void) { return 2; }\n");
+
+  conjure(&dir, &["build"]);
+
+  let ext = if cfg!(target_env = "msvc") {
+    "obj"
+  } else {
+    "o"
+  };
+  let obj_dir = dir
+    .join(".conjure")
+    .join("build")
+    .join("obj")
+    .join("default");
+  let a_obj = obj_dir.join(format!("src_a.{ext}"));
+  let b_obj = obj_dir.join(format!("src_b.{ext}"));
+  assert!(a_obj.is_file() && b_obj.is_file());
+
+  let a_before = fs::metadata(&a_obj).unwrap().modified().unwrap();
+  let b_before = fs::metadata(&b_obj).unwrap().modified().unwrap();
+
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  write(
+    &dir.join("src").join("a.c"),
+    "int a(void) { return 7; }\nint main(void) { return a() - 7; }\n",
+  );
+  conjure(&dir, &["build"]);
+
+  assert_eq!(
+    fs::metadata(&b_obj).unwrap().modified().unwrap(),
+    b_before,
+    "unchanged source was recompiled"
+  );
+  assert!(
+    fs::metadata(&a_obj).unwrap().modified().unwrap() > a_before,
+    "changed source was not recompiled"
+  );
+}
+
+#[test]
+fn test_targets_merge_their_own_flags() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("test_flags");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name core
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  tests {
+    unit {
+      src "src/test_unit.c"
+      c_flags -DTEST_ONLY
+      include "tests_include"
+    }
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("core.c"),
+    "#ifdef TEST_ONLY\n#error library leaked test flags\n#endif\nint core(void) { return 42; }\n",
+  );
+  write(&dir.join("src").join("core.h"), "int core(void);\n");
+  write(
+    &dir.join("tests_include").join("helper.h"),
+    "#pragma once\n",
+  );
+  write(
+    &dir.join("src").join("test_unit.c"),
+    "#include \"core.h\"\n#include \"helper.h\"\n#ifndef TEST_ONLY\n#error test missing its flags\n#endif\nint main(void) { return core() == 42 ? 0 : 1; }\n",
+  );
+
+  conjure(&dir, &["test"]);
+  assert!(
+    dir
+      .join("bin")
+      .join("unit")
+      .join("default")
+      .join(exe("unit"))
+      .is_file()
+  );
+}
+
+#[test]
+fn build_records_object_dependencies() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("objdeps");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name dep
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+}
+"#,
+  );
+  write(&dir.join("src").join("local.h"), "#pragma once\n");
+  write(
+    &dir.join("src").join("main.c"),
+    "#include \"local.h\"\nint main(void) { return 0; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+
+  let graph = dir
+    .join(".conjure")
+    .join("build")
+    .join("objdeps")
+    .join("default.kdl");
+  let text = fs::read_to_string(&graph).unwrap();
+  assert!(text.contains("main.c"), "graph missing source: {text}");
+  assert!(text.contains("local.h"), "graph missing header: {text}");
+}
+
+#[test]
+fn header_change_recompiles_only_dependents() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("header_incremental");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name hdr
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("a.c"),
+    "#include \"h.h\"\nint main(void) { return VALUE - 1; }\n",
+  );
+  write(&dir.join("src").join("b.c"), "int b(void) { return 2; }\n");
+  write(&dir.join("src").join("h.h"), "#define VALUE 1\n");
+
+  conjure(&dir, &["build"]);
+
+  let ext = if cfg!(target_env = "msvc") {
+    "obj"
+  } else {
+    "o"
+  };
+  let obj_dir = dir
+    .join(".conjure")
+    .join("build")
+    .join("obj")
+    .join("default");
+  let a_obj = obj_dir.join(format!("src_a.{ext}"));
+  let b_obj = obj_dir.join(format!("src_b.{ext}"));
+  assert!(a_obj.is_file() && b_obj.is_file());
+
+  let a_before = fs::metadata(&a_obj).unwrap().modified().unwrap();
+  let b_before = fs::metadata(&b_obj).unwrap().modified().unwrap();
+
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  write(&dir.join("src").join("h.h"), "#define VALUE 2\n");
+  conjure(&dir, &["build"]);
+
+  assert!(
+    fs::metadata(&a_obj).unwrap().modified().unwrap() > a_before,
+    "dependent source was not recompiled after a header change"
+  );
+  assert_eq!(
+    fs::metadata(&b_obj).unwrap().modified().unwrap(),
+    b_before,
+    "unrelated source recompiled after a header change"
+  );
+}
+
+#[test]
+fn library_generates_pkg_config_file() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("pc_generation");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name greet
+  language c
+  type library
+  link static
+  version "1.2.3"
+  description "Greeting helpers"
+  compile {
+    standard c11
+    include "include"
+  }
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("greet.c"),
+    "int greet(void) { return 42; }\n",
+  );
+  write(&dir.join("include").join("greet.h"), "int greet(void);\n");
+
+  conjure(&dir, &["build"]);
+
+  let pc = dir
+    .join("lib")
+    .join("default")
+    .join("pkgconfig")
+    .join("greet.pc");
+  let text = fs::read_to_string(&pc).unwrap();
+  assert!(text.contains("Name: greet"), "{text}");
+  assert!(text.contains("Version: 1.2.3"), "{text}");
+  assert!(text.contains("Description: Greeting helpers"), "{text}");
+  assert!(text.contains("Libs: -L${libdir} -lgreet"), "{text}");
+  assert!(text.contains("-I${prefix}/include"), "{text}");
+}
+
+#[test]
+fn pkg_config_false_skips_generation() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("pkgconfig_off");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name greet
+  language c
+  type library
+  link static
+  compile { standard c11 }
+  generate_pc #false
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("greet.c"),
+    "int greet(void) { return 42; }\n",
+  );
+
+  conjure(&dir, &["build"]);
+  assert!(
+    !dir
+      .join("lib")
+      .join("default")
+      .join("pkgconfig")
+      .join("greet.pc")
+      .exists()
+  );
+}
+
+#[test]
+fn explicit_pkg_config_on_binary_warns() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("pkgconfig_bin");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name app
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+  generate_pc #true
+}
+"#,
+  );
+  write(
+    &dir.join("src").join("main.c"),
+    "int main(void) { return 0; }\n",
+  );
+
+  let out = conjure(&dir, &["build"]);
+  assert!(
+    combined(&out).contains("skipping .pc generation"),
+    "{}",
+    combined(&out)
+  );
+}
+
+#[test]
+fn as_forwards_subcommand_help() {
+  let dir = tmp("as_help");
+  write(
+    &dir.join("conjure.kdl"),
+    r#"project {
+  name app
+  language c
+  type binary
+  link dynamic
+  compile { standard c11 }
+  profiles {
+    release {
+      c_flags -O2
+    }
+  }
+}
+"#,
+  );
+
+  let out = run(&dir, &["as", "release", "build", "--help"]);
+  assert!(out.status.success());
+  let text = String::from_utf8_lossy(&out.stdout);
+  assert!(text.contains("--force"), "{text}");
 }

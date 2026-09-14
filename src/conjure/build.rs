@@ -14,16 +14,17 @@
 
 use super::{
   compile::{self, CompileEntry},
-  deps, fingerprint, link, lock, proj_parse,
+  deps, fingerprint, incremental, link, lock, proj_parse,
   proj_parse::{
     BuildSystem, Dependency, Flags, Linkage, Output, Profile, Project,
-    ProjectType, Test,
+    ProjectType, Test, merge_flags,
   },
   toolchain,
   ui::{StepStatus, Ui},
 };
 use miette::{IntoDiagnostic, Result};
 use std::{
+  collections::{BTreeSet, HashSet},
   fs,
   path::{Path, PathBuf},
 };
@@ -71,6 +72,80 @@ fn built_artifact(
   }
 }
 
+/// Which objects to recompile and whether to relink, from the previous
+/// fingerprint.
+struct Plan {
+  compile: Vec<usize>,
+  link: bool,
+}
+
+/// Without compiler depfiles a header's dependents are unknown, so any changed
+/// file that is not a compiled source (an include) - and any change to the
+/// non-file inputs (flags, profile, deps) - invalidates every object.
+fn plan_compile(
+  previous: &str,
+  current: &str,
+  entries: &[(PathBuf, CompileEntry)],
+  graph: &incremental::DepGraph,
+  force: bool,
+  artifact: &Path,
+) -> Plan {
+  let all: Vec<usize> = (0..entries.len()).collect();
+  if force || previous.is_empty() {
+    return Plan {
+      compile: all,
+      link: true,
+    };
+  }
+
+  let (old_base, old_files) = fingerprint::split(previous);
+  let (new_base, new_files) = fingerprint::split(current);
+  let base_changed = old_base != new_base;
+
+  let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+  for (path, hash) in &new_files {
+    if old_files.get(path) != Some(hash) {
+      changed.insert(path.clone());
+    }
+  }
+  for path in old_files.keys() {
+    if !new_files.contains_key(path) {
+      changed.insert(path.clone());
+    }
+  }
+
+  let compile = if base_changed {
+    all
+  } else {
+    entries
+      .iter()
+      .enumerate()
+      .filter_map(|(i, (obj, entry))| {
+        // No dep record yet (a new target, or a pre-depfile object) => rebuild.
+        let dep_changed = graph
+          .objects
+          .get(obj)
+          .is_none_or(|deps| deps.iter().any(|d| changed.contains(d)));
+        (!obj.exists()
+          || changed.contains(&PathBuf::from(entry.source()))
+          || dep_changed)
+          .then_some(i)
+      })
+      .collect()
+  };
+
+  let prev_objects: BTreeSet<&PathBuf> = graph.objects.keys().collect();
+  let curr_objects: BTreeSet<&PathBuf> =
+    entries.iter().map(|(obj, _)| obj).collect();
+
+  let link = !compile.is_empty()
+    || base_changed
+    || prev_objects != curr_objects
+    || !artifact.exists();
+
+  Plan { compile, link }
+}
+
 /// Build one project: skip if current, else build deps, compile, link, and
 /// record the fingerprint.
 pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
@@ -92,23 +167,37 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
   let dep_commits: Vec<String> =
     lock.entries().values().map(|e| e.commit.clone()).collect();
   let mut file_cache = fingerprint::FileCache::load(&ctx.dir);
-  let fp = fingerprint::fingerprint(
+
+  // pkg-config cflags are compile inputs, so they belong in the fingerprint.
+  // Their search dirs live under the deps, which a cold tree hasn't built yet:
+  // resolve early for the fast path, and again for real after `build_deps`.
+
+  let early_pkg = deps::resolve_pkg_config(&project, &ctx.dir, &ctx.root).ok();
+  let early_cflags = early_pkg
+    .as_ref()
+    .map(|(cflags, _)| cflags.as_slice())
+    .unwrap_or(&[]);
+
+  let mut fp = fingerprint::fingerprint(
     &project,
     &ctx.dir,
     profile_name,
     &dep_commits.iter().map(String::as_str).collect::<Vec<_>>(),
+    early_cflags,
     &mut file_cache,
   )?;
 
-  // Saved even on a no-op build, so recorded mtimes advance and the next run
-  // does not re-read files whose mtime changed without a content change.
   file_cache.save(&ctx.dir);
 
   let state_file = ctx.dir.join(".conjure/build/state.kdl");
+  let previous = fs::read_to_string(&state_file).unwrap_or_default();
+  let artifact = built_artifact(&project, &ctx.dir, &ctx.root, profile_name);
   let up_to_date = ctx.record_state
+    && early_pkg.is_some()
     && !ctx.force
-    && fs::read_to_string(&state_file).is_ok_and(|s| s == fp)
-    && built_artifact(&project, &ctx.dir, &ctx.root, profile_name).exists();
+    && previous == fp
+    && artifact.exists();
+
   if up_to_date {
     ui.println(Some(&StepStatus::Info), "Nothing to do")?;
     return Ok(());
@@ -117,19 +206,38 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
   let dep_libs =
     deps::build_deps(ui, &project, &ctx.dir, &ctx.root, ctx.profile)?;
 
-  let (pkg_cflags, pkg_libs) =
-    deps::resolve_pkg_config(&project, &ctx.dir, &ctx.root)?;
+  let (pkg_cflags, pkg_libs) = match early_pkg {
+    Some(resolved) => resolved,
+    None => {
+      let (cflags, libs) =
+        deps::resolve_pkg_config(&project, &ctx.dir, &ctx.root)?;
+      fp = fingerprint::fingerprint(
+        &project,
+        &ctx.dir,
+        profile_name,
+        &dep_commits.iter().map(String::as_str).collect::<Vec<_>>(),
+        &cflags,
+        &mut file_cache,
+      )?;
+      (cflags, libs)
+    }
+  };
 
-  let (objects, entries): (Vec<PathBuf>, Vec<CompileEntry>) =
-    compile::compile_entries(
-      &ctx.dir,
-      &ctx.root,
-      &project,
-      profile_name,
-      pkg_cflags,
-    )?
-    .into_iter()
-    .unzip();
+  let entries = compile::compile_entries(
+    &ctx.dir,
+    &ctx.root,
+    &project,
+    profile_name,
+    pkg_cflags.clone(),
+    true,
+  )?;
+
+  let mut deps_graph = incremental::DepGraph::load(&ctx.dir, profile_name);
+
+  let plan =
+    plan_compile(&previous, &fp, &entries, &deps_graph, ctx.force, &artifact);
+  let objects: Vec<PathBuf> =
+    entries.iter().map(|(obj, _)| obj.clone()).collect();
 
   let compile = project
     .compile
@@ -146,23 +254,66 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     std::thread::available_parallelism().map_or(1, |n| n.get())
   });
 
-  let build_env = toolchain::resolve(compile, &project.language).env();
-  compile::compile(ui, &ctx.dir, entries, threads, build_env)?;
+  let tc = toolchain::resolve(compile, &project.language);
 
-  let inputs = link::LinkInputs {
-    objects: &objects,
-    libs: &dep_libs,
-    extra_libs: &pkg_libs,
-    ld_flags: &ld_flags,
-    compile,
-  };
+  // Only the objects compiled this run wrote a depfile.
+  let compiled: Vec<PathBuf> =
+    plan.compile.iter().map(|&i| entries[i].0.clone()).collect();
 
-  link::produce(ui, &project, &ctx.dir, &ctx.root, profile_name, &inputs)?;
+  if !plan.compile.is_empty() {
+    let selected: Vec<CompileEntry> = entries
+      .into_iter()
+      .enumerate()
+      .filter_map(|(i, (_, entry))| plan.compile.contains(&i).then_some(entry))
+      .collect();
+    compile::compile(ui, &ctx.dir, selected, threads, tc.env())?;
+  }
+
+  if ctx.record_state && !compiled.is_empty() {
+    for obj in &compiled {
+      let (depfile, _) = tc.depfile(&obj.display().to_string());
+      if let Ok(text) = fs::read_to_string(&depfile) {
+        deps_graph
+          .objects
+          .insert(obj.clone(), tc.parse_depfile(&text));
+        let _ = fs::remove_file(&depfile);
+      }
+    }
+    let current: HashSet<&PathBuf> = objects.iter().collect();
+    deps_graph.objects.retain(|obj, _| current.contains(obj));
+    deps_graph.save(&ctx.dir, profile_name);
+
+    // The graph now names this build's headers, and `fingerprint` hashes them,
+    // so re-key with it; otherwise the next run sees a dep-file delta and
+    // rebuilds once more.
+    fp = fingerprint::fingerprint(
+      &project,
+      &ctx.dir,
+      profile_name,
+      &dep_commits.iter().map(String::as_str).collect::<Vec<_>>(),
+      &pkg_cflags,
+      &mut file_cache,
+    )?;
+    file_cache.save(&ctx.dir);
+  }
+
+  if plan.link {
+    let inputs = link::LinkInputs {
+      objects: &objects,
+      libs: &dep_libs,
+      extra_libs: &pkg_libs,
+      ld_flags: &ld_flags,
+      compile,
+    };
+
+    link::produce(ui, &project, &ctx.dir, &ctx.root, profile_name, &inputs)?;
+  }
 
   if ctx.record_state {
     let _ = fs::create_dir_all(state_file.parent().unwrap());
     let _ = fs::write(state_file, fp);
   }
+
   Ok(())
 }
 
@@ -173,6 +324,7 @@ fn test_profile(p: Profile) -> Profile {
     src: None,
     tests: None,
     artifact: None,
+    generate_pc: None,
     ..p.clone()
   }
 }
@@ -192,6 +344,12 @@ pub fn test_project(
 
   let mut compile = parent.compile.clone().unwrap_or_default();
   compile.src = Some(src);
+  compile.include =
+    merge_flags(compile.include.as_ref(), test.include.as_ref());
+  compile.c_flags =
+    merge_flags(compile.c_flags.as_ref(), test.c_flags.as_ref());
+  compile.ld_flags =
+    merge_flags(compile.ld_flags.as_ref(), test.ld_flags.as_ref());
 
   let mut dependencies = parent.dependencies.clone().unwrap_or_default();
   dependencies.insert(

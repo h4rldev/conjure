@@ -264,9 +264,8 @@ struct CompileCommandsArgs {
 struct AsArgs {
   /// Profile to use for the subcommand
   profile: String,
-  /// Subcommand to run (all --help commands are supported)
-  #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-  subcommand: Vec<String>,
+  #[command(subcommand)]
+  subcommand: AsCommands,
 }
 
 #[derive(Args)]
@@ -276,6 +275,32 @@ struct TestArgs {
   /// Profile to use for building the tests
   #[arg(long, short = 'p')]
   profile: Option<String>,
+}
+
+/// Subcommands `conjure as` forwards to. Mirrors [`Commands`] minus `As`:
+/// nesting `As` would recurse clap's help tree forever.
+#[derive(Subcommand)]
+enum AsCommands {
+  /// Create a new Conjure project
+  New(NewArgs),
+  /// Initialize a Conjure project in the current directory
+  Init(InitArgs),
+  /// Add a dependency to the project
+  Add(AddArgs),
+  /// Remove a dependency from the project
+  #[command(alias = "remove")]
+  Rm(RemoveArgs),
+  /// Lock the project's dependencies
+  Lock,
+  /// Update the project's dependencies, and recache them.
+  Update(UpdateArgs),
+  /// Build the project
+  Build(BuildArgs),
+  /// Generate a compile_commands.json for clangd
+  #[command(name = "compile-commands")]
+  Compile(CompileCommandsArgs),
+  /// Build the project's tests
+  Test(TestArgs),
 }
 
 #[derive(Subcommand)]
@@ -302,6 +327,22 @@ enum Commands {
   As(AsArgs),
   /// Build the project's tests
   Test(TestArgs),
+}
+
+impl From<AsCommands> for Commands {
+  fn from(cmd: AsCommands) -> Self {
+    match cmd {
+      AsCommands::New(args) => Commands::New(args),
+      AsCommands::Init(args) => Commands::Init(args),
+      AsCommands::Add(args) => Commands::Add(args),
+      AsCommands::Rm(args) => Commands::Rm(args),
+      AsCommands::Lock => Commands::Lock,
+      AsCommands::Update(args) => Commands::Update(args),
+      AsCommands::Build(args) => Commands::Build(args),
+      AsCommands::Compile(args) => Commands::Compile(args),
+      AsCommands::Test(args) => Commands::Test(args),
+    }
+  }
 }
 
 fn styles() -> Styles {
@@ -1026,7 +1067,7 @@ fn handle_compile_commands(args: &CompileCommandsArgs) -> Result<()> {
 /// Re-enter the CLI with `CONJURE_PROFILE` set, so the wrapped subcommand runs
 /// under `args.profile`. The profile must exist; `CONJURE_PROFILE` is how the
 /// subcommand's `handle_*` will see it.
-fn handle_as(args: &AsArgs) -> Result<()> {
+fn handle_as(args: AsArgs) -> Result<()> {
   let project = Project::from_file("conjure.kdl")?;
   let profiles = project
     .profiles
@@ -1040,13 +1081,10 @@ fn handle_as(args: &AsArgs) -> Result<()> {
   );
 
   unsafe {
-    std::env::set_var("CONJURE_PROFILE", args.profile.clone());
+    std::env::set_var("CONJURE_PROFILE", &args.profile);
   }
 
-  let argv0 = std::env::args().next().unwrap_or_else(|| "conjure".into());
-  let inner =
-    Cli::parse_from([argv0].into_iter().chain(args.subcommand.iter().cloned()));
-  run_command(&inner.command)
+  run_command(&args.subcommand.into())
 }
 
 fn run_command(cmd: &Commands) -> Result<()> {
@@ -1077,12 +1115,10 @@ fn parse_cli() -> Cli {
 /// CLI entry point.
 pub fn run() -> Result<(), miette::Error> {
   let cli = parse_cli();
-
-  if let Commands::As(args) = &cli.command {
-    return handle_as(args);
+  match cli.command {
+    Commands::As(args) => handle_as(args),
+    cmd => run_command(&cmd),
   }
-
-  run_command(&cli.command)
 }
 
 #[cfg(test)]

@@ -42,6 +42,12 @@ pub struct CompileEntry {
   file: String,
 }
 
+impl CompileEntry {
+  pub fn source(&self) -> &str {
+    &self.file
+  }
+}
+
 /// Recursively collect files under `dir` whose extension is in `exts`. An empty
 /// `exts` collects every file (used to fingerprint include trees).
 pub fn find_sources(
@@ -112,6 +118,7 @@ pub fn compile_entries(
   project: &Project,
   profile_name: &str,
   pkg_cflags: Vec<String>,
+  depfiles: bool,
 ) -> Result<Vec<(PathBuf, CompileEntry)>> {
   let compile = project
     .compile
@@ -191,6 +198,9 @@ pub fn compile_entries(
       }
 
       arguments.extend(c_flags.iter().filter(|s| !s.is_empty()).cloned());
+      if depfiles {
+        arguments.extend(tc.depfile(&obj.display().to_string()).1);
+      }
       arguments.extend(
         tc.compile_tail(&src.display().to_string(), &obj.display().to_string()),
       );
@@ -286,7 +296,7 @@ pub fn compile_commands(
     let name = resolved.map_or("default", |(n, _)| n);
     let effective = proj.with_profile(resolved.map(|(_, p)| p));
     entries.extend(
-      compile_entries(&dir, &root, &effective, name, vec![])?
+      compile_entries(&dir, &root, &effective, name, vec![], false)?
         .into_iter()
         .map(|(_, e)| e),
     );
@@ -302,7 +312,7 @@ pub fn compile_commands(
         let test_out = test_resolved.map_or("default", |(n, _)| n);
         let test_eff = test_proj.with_profile(test_resolved.map(|(_, p)| p));
         entries.extend(
-          compile_entries(&dir, &root, &test_eff, test_out, vec![])?
+          compile_entries(&dir, &root, &test_eff, test_out, vec![], false)?
             .into_iter()
             .map(|(_, e)| e),
         );

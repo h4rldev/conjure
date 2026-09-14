@@ -57,7 +57,7 @@ conjure lock                     # pin dependencies (offline re-pin)
 conjure update [name]            # re-fetch and re-pin dependencies
 conjure build                    # build
 conjure build -p release         # build a profile
-conjure as release -- build      # run a command under a profile
+conjure as release build         # run a command under a profile
 conjure compile-commands         # write compile_commands.json for clangd
 conjure test                     # build all test targets
 conjure test unit                # build one test target

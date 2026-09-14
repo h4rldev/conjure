@@ -30,7 +30,7 @@ const SECTION_COMMENTS: &[(&str, &str)] = &[
   ),
   (
     "profiles",
-    "build profiles: `conjure as <name> -- <subcommand>`, e.g. `conjure as release -- build`\n  profile_name {\n    type library               // type, link, cc, linker, standard, arch: scalar overrides\n    link static\n    artifact \"foo-debug\"       // base name of the built artifact; default = project name\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n    tests { }                  // profile-specific tests, merged over the top-level set\n  }",
+    "build profiles: `conjure as <name> <subcommand>`, e.g. `conjure as release build`\n  profile_name {\n    extends \"base\" \"other\"  // inherit these profiles first, in order\n    type library               // type, link, cc, linker, standard, arch: scalar overrides\n    link static\n    artifact \"foo-debug\"       // base name of the built artifact; default = project name\n    generate_pc #false         // write a pkg-config .pc for a library; default = project's\n    c_flags replace \"-g\" \"-O0\" // `replace` overrides base, `append` (default) adds\n    ld_flags -flto\n    tests { }                  // profile-specific tests, merged over the top-level set\n  }",
   ),
   (
     "siblings",
@@ -38,7 +38,7 @@ const SECTION_COMMENTS: &[(&str, &str)] = &[
   ),
   (
     "tests",
-    "test targets: each name compiles to a binary that links the project's\nlibrary, so the project must be `type library`; built by `conjure test` and\nnever run by conjure\n  test_name { src \"tests/test_name.c\" }",
+    "test targets: each name compiles to a binary that links the project's\nlibrary, so the project must be `type library`; built by `conjure test` and\nnever run by conjure\n  test_name {\n    src \"tests/test_name.c\"\n    c_flags -DBUILD_TEST   // extra compile flags, merged over the project's\n    ld_flags -lm           // extra link flags\n    include \"tests/include\"\n  }",
   ),
   (
     "dependencies",

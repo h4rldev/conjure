@@ -19,7 +19,7 @@
 /***********************************************************************/
 
 use super::{
-  proj_parse::{Compile, Project},
+  proj_parse::{Compile, Flags, Project},
   toolchain::{self, Toolchain},
   ui::{StepStatus, Ui},
 };
@@ -115,6 +115,81 @@ fn split_ws(s: &str) -> Vec<String> {
 
 fn is_static_flag(f: &str) -> bool {
   matches!(f, "-static" | "-Wl,-static")
+}
+
+/// Write the library's pkg-config file under `<libdir>/pkgconfig/`, anchored to
+/// `${pcfiledir}` so the tree stays valid when moved.
+fn write_pkg_config(
+  project: &Project,
+  root: &Path,
+  lib: &Path,
+  inputs: &LinkInputs<'_>,
+) -> Result<()> {
+  let libdir = lib.parent().expect("library path has a parent");
+  let pc_dir = libdir.join("pkgconfig");
+
+  let depth = pc_dir
+    .strip_prefix(root)
+    .map(|p| p.components().count())
+    .unwrap_or(0);
+  let prefix = format!("${{pcfiledir}}/{}", "../".repeat(depth));
+  let prefix = prefix.trim_end_matches('/');
+
+  let artifact = project.artifact_name();
+  let mut out = String::new();
+  out.push_str(&format!("prefix={prefix}\n"));
+  match libdir.strip_prefix(root) {
+    Ok(rel) => out.push_str(&format!("libdir=${{prefix}}/{}\n", rel.display())),
+    Err(_) => out.push_str(&format!("libdir={}\n", libdir.display())),
+  }
+  out.push_str(&format!("Name: {}\n", project.name));
+  out.push_str(&format!(
+    "Description: {}\n",
+    project
+      .description
+      .as_deref()
+      .unwrap_or(project.name.as_str())
+  ));
+  out.push_str(&format!(
+    "Version: {}\n",
+    project.version.as_deref().unwrap_or("0.0.0")
+  ));
+
+  let include = project
+    .compile
+    .as_ref()
+    .and_then(|c| c.include.as_ref())
+    .map(Flags::list)
+    .unwrap_or_default();
+  if !include.is_empty() {
+    let cflags: Vec<String> = include
+      .iter()
+      .map(|inc| {
+        let p = Path::new(inc);
+        match p.strip_prefix(root) {
+          Ok(rel) => format!("-I${{prefix}}/{}", rel.display()),
+          Err(_) if p.is_absolute() => format!("-I{}", p.display()),
+          Err(_) => format!("-I${{prefix}}/{inc}"),
+        }
+      })
+      .collect();
+    out.push_str(&format!("Cflags: {}\n", cflags.join(" ")));
+  }
+
+  out.push_str(&format!("Libs: -L${{libdir}} -l{artifact}\n"));
+
+  if !inputs.libs.is_empty() {
+    let private: Vec<String> = inputs
+      .libs
+      .iter()
+      .map(|p| p.display().to_string())
+      .collect();
+    out.push_str(&format!("Libs.private: {}\n", private.join(" ")));
+  }
+
+  fs::create_dir_all(&pc_dir).into_diagnostic()?;
+  fs::write(pc_dir.join(format!("{artifact}.pc")), out).into_diagnostic()?;
+  Ok(())
 }
 
 fn driver_argv(
@@ -425,6 +500,22 @@ pub fn library_path(
   }
 }
 
+/// The path a consumer links: on MSVC a shared library's import library
+/// (`<name>.lib`), otherwise the library itself.
+pub fn link_library_path(
+  project: &Project,
+  root: &Path,
+  profile_name: &str,
+  scoped: bool,
+) -> PathBuf {
+  let lib = library_path(project, root, profile_name, scoped);
+  if cfg!(target_env = "msvc") && !project.want_static() {
+    lib.with_extension("lib")
+  } else {
+    lib
+  }
+}
+
 /// Produce the project's artifact: archive a static library, link a shared
 /// library, or link a binary, then report its path.
 pub fn produce(
@@ -460,6 +551,10 @@ pub fn produce(
         Some(&StepStatus::Success),
         format!("Built {}", lib.display()),
       )?;
+
+      if project.generate_pc.unwrap_or(true) {
+        write_pkg_config(project, root, &lib, inputs)?;
+      }
     } else {
       let lib = library_path(project, root, profile_name, scoped);
       fs::create_dir_all(lib.parent().unwrap()).into_diagnostic()?;
@@ -478,6 +573,10 @@ pub fn produce(
         Some(&StepStatus::Success),
         format!("Built {}", lib.display()),
       )?;
+
+      if project.generate_pc.unwrap_or(true) {
+        write_pkg_config(project, root, &lib, inputs)?;
+      }
     }
   } else {
     let bin = binary_path(project, root, profile_name, scoped);
@@ -494,10 +593,21 @@ pub fn produce(
       },
       inputs,
     )?;
+
     ui.println(
       Some(&StepStatus::Success),
       format!("Built {}", bin.display()),
     )?;
+
+    if project.generate_pc == Some(true) {
+      ui.println(
+        Some(&StepStatus::Info),
+        format!(
+          "{}: pkg-config is enabled but this is a binary; skipping .pc generation",
+          project.name
+        ),
+      )?;
+    }
   }
 
   Ok(())
@@ -590,7 +700,14 @@ mod tests {
     let argv = tc.raw_link_args(&job).unwrap();
     assert_eq!(
       argv,
-      vec!["link.exe", "/nologo", "/DLL", "a.obj", "/OUT:mylib.dll"]
+      vec![
+        "link.exe",
+        "/nologo",
+        "/DLL",
+        "a.obj",
+        "/OUT:mylib.dll",
+        "/IMPLIB:mylib.lib",
+      ]
     );
   }
 
@@ -683,7 +800,15 @@ mod tests {
 
     assert_eq!(
       tc.driver_link_args(&job),
-      vec!["cl", "/nologo", "/LD", "a.obj", "/Fe:mylib.dll"]
+      vec![
+        "cl",
+        "/nologo",
+        "/LD",
+        "a.obj",
+        "/Fe:mylib.dll",
+        "/link",
+        "/IMPLIB:mylib.lib",
+      ]
     )
   }
 
