@@ -33,6 +33,10 @@
 
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.openssl];
+
+        meta = {
+          mainProgram = "conjure";
+        };
       };
   in {
     packages = eachSystem (system: let
