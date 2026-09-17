@@ -1775,3 +1775,19 @@ fn pkg_config_requires_private_lists_declared_packages() {
   assert!(text.contains("Requires.private: zlib"), "{text}");
   assert!(!text.contains("-lz"), "{text}");
 }
+
+#[test]
+fn finds_manifest_in_ancestor() {
+  if !have_cc() {
+    return;
+  }
+  let dir = tmp("ancestor");
+  write(&dir.join("conjure.kdl"), BIN_MANIFEST);
+  write(&dir.join("src").join("main.c"), MAIN_C);
+  let sub = dir.join("nested").join("deeper");
+  fs::create_dir_all(&sub).unwrap();
+
+  let out = run(&sub, &["build"]);
+  assert!(out.status.success(), "{}", combined(&out));
+  assert!(dir.join("bin").join("default").join(exe("hello")).is_file());
+}

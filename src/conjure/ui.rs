@@ -23,12 +23,18 @@ use std::{
   io::{BufRead, BufReader, Read, Write},
   path::Path,
   process::{Command, Stdio},
+  sync::atomic::{AtomicU8, Ordering},
   time::Duration,
 };
 
 /***********************************************************************/
 
 const SPIN_CHARS: &str = "⠉⠙⠘⠰⢠⣠⣀⣄⡄⠆⠃⠋";
+static VERBOSE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_verbose(level: u8) {
+  VERBOSE.store(level, Ordering::Relaxed);
+}
 
 /// Leading glyph for a status line, or the message unchanged when `status` is
 /// `None` (e.g. forwarded tool output).
@@ -45,6 +51,7 @@ pub enum StepStatus {
 /// used to forward subprocess output from worker threads.
 pub struct Ui {
   mp: MultiProgress,
+  verbose: u8,
 }
 
 impl Ui {
@@ -65,6 +72,18 @@ impl Ui {
       .map(|a| a.as_ref().to_string_lossy())
       .collect::<Vec<_>>()
       .join(" ");
+
+    if self.verbose > 0 {
+      self.println(None, format!("(cd {} && {joined})", dir.display()))?;
+      if self.verbose > 1 {
+        for (k, v) in env {
+          self.println(
+            None,
+            format!("  {}={}", k.to_string_lossy(), v.to_string_lossy()),
+          )?;
+        }
+      }
+    }
 
     let mut child = Command::new(&args[0])
       .args(&args[1..])
@@ -118,6 +137,7 @@ impl Ui {
     let _ = std::io::stdout().flush();
     Self {
       mp: MultiProgress::new(),
+      verbose: VERBOSE.load(Ordering::Relaxed),
     }
   }
 

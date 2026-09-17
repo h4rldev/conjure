@@ -1,3 +1,28 @@
+# v0.4.3
+
+Highlights since 0.4.2.
+
+### Flags containing `=` are no longer dropped
+
+`c_flags`/`ld_flags` entries like `-DFOO=1` or `-fsanitize=address` were parsed
+by KDL as node properties and silently removed, so sanitizer flags never reached
+the compiler or linker. They are now rejected at parse time with a message
+telling you to quote them (`"-fsanitize=address"`), so the drop cannot go
+unnoticed.
+
+### Verbose builds
+
+`-v` echoes every compiler, linker, pkg-config, and git command, and `-vv` also
+prints the environment each one runs with. Useful for confirming that flags and
+search paths actually reach the toolchain.
+
+### Manifests are found from subdirectories
+
+`conjure` walks up from the current directory, up to 10 levels, to find
+`conjure.kdl` and runs from that project root, so build, test, add, and the rest
+work from anywhere inside the tree. `conjure new` and `conjure init` still act
+on the current directory.
+
 # v0.4.2
 
 Highlights since 0.4.1.

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
   collections::{HashMap, HashSet},
   fs,
-  path::Path,
+  path::{Path, PathBuf},
   string::String,
 };
 
@@ -725,6 +725,50 @@ where
   d.deserialize_option(V)
 }
 
+/// Node names whose arguments are flags or paths. A `name=value` argument under
+/// one of these is parsed by KDL as a node property and never reaches the field,
+/// so reject it with a quoting hint instead of dropping it silently. This is how
+/// `-DFOO=1` and `-fsanitize=address` were vanishing.
+const VALUE_NODES: &[&str] = &["c_flags", "ld_flags", "include", "src"];
+
+fn reject_unquoted_eq_flags(input: &str) -> Result<(), Error> {
+  fn walk(node: &kdl::KdlNode, bad: &mut Vec<String>) {
+    if VALUE_NODES.contains(&node.name().value()) {
+      for entry in node.entries() {
+        if let Some(name) = entry.name() {
+          let value = entry
+            .value()
+            .as_string()
+            .map(str::to_string)
+            .unwrap_or_else(|| entry.value().to_string());
+          let item = format!("{}={}", name.value(), value);
+          bad.push(format!(
+            "`{item}` is parsed as a KDL property and dropped; quote it as `\"{item}\"`"
+          ));
+        }
+      }
+    }
+    if let Some(children) = node.children() {
+      for child in children.nodes() {
+        walk(child, bad);
+      }
+    }
+  }
+
+  // A syntax error is reported by the deserialize step; only inspect valid docs.
+  let Ok(doc) = input.parse::<kdl::KdlDocument>() else {
+    return Ok(());
+  };
+  let mut bad = Vec::new();
+  for node in doc.nodes() {
+    walk(node, &mut bad);
+  }
+  if let Some(first) = bad.into_iter().next() {
+    return Err(Error::Validate(miette::miette!("{first}")));
+  }
+  Ok(())
+}
+
 /// The project file format.
 ///
 /// # Schema
@@ -875,6 +919,9 @@ impl Default for Project {
   }
 }
 
+/// How many parent levels [`Project::find_root`] looks through before giving up.
+const ROOT_SEARCH_DEPTH: usize = 10;
+
 impl Project {
   /// Whether this project links statically, i.e. `link static`.
   pub fn want_static(&self) -> bool {
@@ -884,6 +931,21 @@ impl Project {
   /// Whether this project produces a library rather than a binary.
   pub fn is_library(&self) -> bool {
     matches!(self.ty, ProjectType::Library)
+  }
+
+  /// The nearest directory, starting at the current one, that holds a
+  /// `conjure.kdl`, searching up to [`ROOT_SEARCH_DEPTH`] levels up.
+  pub fn find_root() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..=ROOT_SEARCH_DEPTH {
+      if dir.join("conjure.kdl").is_file() {
+        return Some(dir);
+      }
+      if !dir.pop() {
+        break;
+      }
+    }
+    None
   }
 
   /// `name` resolved against this project's own profiles, or `None` when it
@@ -973,6 +1035,7 @@ impl Project {
 
   /// Parse and validate a manifest.      ld_flags -lxkbcommon -lxkbcommon-x11 -lxcb -lxcb-cursor -lxcb-icccm -lxcb-randr -lbread-x11-release -lhtils -lvulkan -ldl
   pub fn from_str(input: &str) -> Result<Self, Error> {
+    reject_unquoted_eq_flags(input)?;
     let mut project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
     if let Some(deps) = &project.dependencies {
       for (name, dep) in deps {
@@ -1377,5 +1440,16 @@ mod tests {
         .and_then(|o| o.requires.clone()),
       Some(vec!["zlib".to_string(), "harfbuzz".to_string()])
     );
+  }
+
+  #[test]
+  fn unquoted_eq_flags_are_rejected() {
+    for src in [
+      "project {\n  name t\n  language c\n  type binary\n  compile {\n    c_flags -DFOO=1\n  }\n}",
+      "project {\n  name t\n  language c\n  type binary\n  profiles {\n    p {\n      ld_flags -fsanitize=address\n    }\n  }\n}",
+      "project {\n  name t\n  language c\n  type binary\n  compile {\n    src a=b.c\n  }\n}",
+    ] {
+      assert!(Project::from_str(src).is_err(), "should reject: {src}");
+    }
   }
 }

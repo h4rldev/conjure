@@ -16,7 +16,7 @@ use super::{
     slugify,
   },
   proj_write::fix_braces,
-  ui::{StepStatus, Ui},
+  ui::{self, StepStatus, Ui},
 };
 use clap::{
   Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
@@ -365,6 +365,10 @@ fn styles() -> Styles {
 struct Cli {
   #[command(subcommand)]
   command: Commands,
+
+  /// Increase verbosity (-v: echo commands, -vv: also their environment)
+  #[arg(long, short = 'v', action = clap::ArgAction::Count, global = true)]
+  verbose: u8,
 }
 
 fn project_arch(arch: ArchType) -> Arch {
@@ -697,8 +701,8 @@ fn lock_remote(
 /// Whether the current manifest declares any profiles (used to hide the `as`
 /// subcommand when it would be useless).
 fn has_profiles() -> bool {
-  Project::from_file("conjure.kdl")
-    .ok()
+  Project::find_root()
+    .and_then(|root| Project::from_file(root.join("conjure.kdl")).ok())
     .and_then(|p| p.profiles)
     .is_some_and(|p| !p.is_empty())
 }
@@ -1126,6 +1130,16 @@ fn parse_cli() -> Cli {
 /// CLI entry point.
 pub fn run() -> Result<(), miette::Error> {
   let cli = parse_cli();
+  ui::set_verbose(cli.verbose);
+
+  // Commands against an existing project run from its root, found in an
+  // ancestor when invoked from a subdirectory. `new`/`init` create in the cwd.
+  if !matches!(&cli.command, Commands::New(_) | Commands::Init(_))
+    && let Some(root) = proj_parse::Project::find_root()
+  {
+    std::env::set_current_dir(&root).into_diagnostic()?;
+  }
+
   match cli.command {
     Commands::As(args) => handle_as(args),
     cmd => run_command(&cmd),
