@@ -1,3 +1,16 @@
+# v0.4.4
+
+Highlights since 0.4.3.
+
+### Failed builds keep their output
+
+Compiler, linker, and dependency build output went through the progress display,
+which drops it when stderr is not a terminal (piped, redirected, or in CI). A
+failed build then showed only the generic "Failed to run ..." error, whose
+"check the output above" hint pointed at nothing. Child output now bypasses the
+progress display, so the real compiler or linker diagnostic always appears,
+terminal or not.
+
 # v0.4.3
 
 Highlights since 0.4.2.
