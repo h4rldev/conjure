@@ -1,0 +1,9 @@
+project {
+  name bad
+  language c
+  type binary
+  link dynamic
+  compile {
+    standard c11
+  }
+}

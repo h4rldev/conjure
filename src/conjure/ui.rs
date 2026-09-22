@@ -110,7 +110,7 @@ impl Ui {
       std::thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
-          let _ = mp.println(line);
+          mp.suspend(|| eprintln!("{line}"));
         }
       })
     };
