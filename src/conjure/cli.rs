@@ -126,6 +126,15 @@ enum Transport {
   Https,
 }
 
+impl Transport {
+  fn name(&self) -> &'static str {
+    match self {
+      Transport::Ssh => "ssh",
+      Transport::Https => "https",
+    }
+  }
+}
+
 #[derive(Clone, ValueEnum)]
 enum BuildSystem {
   #[value(alias = "make")]
@@ -144,6 +153,20 @@ enum BuildSystem {
   Just,
 }
 
+impl BuildSystem {
+  fn name(&self) -> &'static str {
+    match self {
+      BuildSystem::Make => "make",
+      BuildSystem::Cmake => "cmake",
+      BuildSystem::Autotools => "autotools",
+      BuildSystem::Meson => "meson",
+      BuildSystem::Ninja => "ninja",
+      BuildSystem::Xmake => "xmake",
+      BuildSystem::Just => "just",
+    }
+  }
+}
+
 #[derive(Clone, ValueEnum)]
 enum LocalOrRemote {
   #[value(alias = "local")]
@@ -156,6 +179,18 @@ enum LocalOrRemote {
   Bitbucket,
   #[value(alias = "git")]
   Git,
+}
+
+impl LocalOrRemote {
+  fn name(&self) -> &'static str {
+    match self {
+      LocalOrRemote::Local => "local",
+      LocalOrRemote::Codeberg => "codeberg",
+      LocalOrRemote::Github => "github",
+      LocalOrRemote::Bitbucket => "bitbucket",
+      LocalOrRemote::Git => "git",
+    }
+  }
 }
 
 #[derive(Args)]
@@ -592,21 +627,23 @@ fn edit_dependencies(
       "No project node in conjure.kdl"
     )
   })?;
-  if project.children_mut().is_none() {
-    *project.children_mut() = Some(kdl::KdlDocument::new());
-  }
-  let project_children = project.children_mut().as_mut().unwrap();
 
+  let project_children = project
+    .children_mut()
+    .get_or_insert_with(kdl::KdlDocument::new);
   if project_children.get_mut("dependencies").is_none() {
     let mut n = kdl::KdlNode::new("dependencies");
     n.set_children(kdl::KdlDocument::new());
     project_children.nodes_mut().push(n);
   }
-  let deps = project_children.get_mut("dependencies").unwrap();
-  if deps.children_mut().is_none() {
-    *deps.children_mut() = Some(kdl::KdlDocument::new());
-  }
-  let children = deps.children_mut().as_mut().unwrap();
+
+  let deps = project_children
+    .get_mut("dependencies")
+    .ok_or_else(|| miette::miette!("Failed to create the dependencies node"))?;
+
+  let children = deps
+    .children_mut()
+    .get_or_insert_with(kdl::KdlDocument::new);
 
   miette::ensure!(
     args.force || children.get(name).is_none(),
@@ -627,7 +664,7 @@ fn edit_dependencies(
     }
     host => frag.push_str(&format!(
       "\n  remote {} \"{}\"",
-      host.to_possible_value().unwrap().get_name(),
+      host.name(),
       args.path_or_url,
     )),
   }
@@ -661,12 +698,15 @@ fn lock_remote(
   dep: &proj_parse::Dependency,
   fetch: bool,
 ) -> Result<()> {
-  let (host, path) = match dep.remote.as_ref() {
-    Some(proj_parse::Remote::Codeberg(p)) => ("codeberg", p),
-    Some(proj_parse::Remote::GitHub(p)) => ("github", p),
-    Some(proj_parse::Remote::BitBucket(p)) => ("bitbucket", p),
-    Some(proj_parse::Remote::Git(p)) => ("git", p),
-    None => unreachable!(),
+  let remote = dep.remote.as_ref().ok_or_else(|| {
+    miette::miette!("Dependency `{name}` is local; nothing to lock")
+  })?;
+
+  let (host, path) = match remote {
+    proj_parse::Remote::Codeberg(p) => ("codeberg", p),
+    proj_parse::Remote::GitHub(p) => ("github", p),
+    proj_parse::Remote::BitBucket(p) => ("bitbucket", p),
+    proj_parse::Remote::Git(p) => ("git", p),
   };
 
   let t = match dep.transport {
@@ -688,13 +728,7 @@ fn lock_remote(
   let r#ref = git::head_ref(&dir)?;
   git::checkout(&dir, &commit)?;
 
-  lock.lock(
-    name,
-    Some(dep.remote.clone().unwrap()),
-    dep.transport,
-    r#ref,
-    commit,
-  );
+  lock.lock(name, Some(remote.clone()), dep.transport, r#ref, commit);
   Ok(())
 }
 
@@ -813,23 +847,15 @@ fn handle_add(args: &AddArgs) -> Result<()> {
   let (dir, build, transport_name) = match &args.local_or_remote {
     LocalOrRemote::Local => (None, None, None),
     host => {
-      let host_val = &host.to_possible_value().unwrap();
-      let host_name = host_val.get_name();
-      let t = transport
-        .to_possible_value()
-        .unwrap()
-        .get_name()
-        .to_string();
+      let host_name = host.name();
+      let t = transport.name().to_string();
       let dir =
         git::clone_remote(Some(&ui), host_name, &args.path_or_url, &t, &name)?;
       let build = args
         .build
         .as_ref()
-        .map(|b| b.to_possible_value().unwrap().get_name().to_string())
-        .or_else(|| {
-          guess_build_system(&dir)
-            .map(|b| b.to_possible_value().unwrap().get_name().to_string())
-        });
+        .map(|b| b.name().to_string())
+        .or_else(|| guess_build_system(&dir).map(|b| b.name().to_string()));
       (Some(dir), build, Some(t))
     }
   };

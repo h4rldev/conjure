@@ -1,3 +1,76 @@
+# v0.5.0
+
+Highlights since 0.4.3.
+
+### Plugin artifact filenames
+
+`output.name` writes a literal filename, without the platform `lib` prefix or
+the `<project>/<profile>` nesting, so Erlang NIFs, Python/Ruby/Lua extensions,
+and similar plugins can land at the exact path their loader expects. `output`
+also merges per profile now, so a profile can change the destination without
+repeating the rest of the manifest.
+
+### MSVC shared-library exports
+
+MSVC only exports symbols marked `__declspec(dllexport)`. Opt in with
+`compile.export_all #true` on a shared library and Conjure reads the object
+symbols with `dumpbin`, writes a `.def`, and passes `/DEF:` to the linker. Other
+platforms are unchanged. x64 is verified end to end; x86 symbol decoration is
+covered by unit tests.
+
+### Project-level pkg-config
+
+`compile.pkg_config` now accepts package names for the project itself, not just
+for dependencies. Their cflags and libraries are resolved alongside dependency
+packages and feed both compilation and linking.
+
+### Bare booleans in manifests
+
+Boolean fields accept `true` and `false` as well as `#true`, `#false`, and quoted
+strings. `symlink_binaries true` no longer requires the KDL v2 spelling.
+
+### Parallel test builds
+
+`conjure test` builds the parent once, then compiles and links independent test
+targets in parallel. Each target gets its own object namespace, and the total
+compiler thread count stays within the requested budget.
+
+### Signal termination is a failure
+
+A child killed by a signal has no exit code. It now reports failure instead of
+being mistaken for a successful command.
+
+### Faster incremental builds
+
+- Local dependencies are fingerprinted through the persistent file cache instead
+  of a fresh cache, so they are not hashed twice.
+- Dependency library discovery skips VCS metadata and conjure's cache, stops at
+  the first matching library, and keeps libtool's `.libs` directory.
+- Compiler arguments shared by every source are built once; object selection is
+  a binary search; source scanning avoids an extra stat per entry.
+- Include directories are walked only until depfiles exist. After that, only
+  headers named by depfiles are hashed.
+- After a compile, only the depfile block of the fingerprint is replaced; source
+  and local-dependency hashes are reused.
+- No-op builds no longer rewrite `fingerprint.kdl` or `deps.kdl`.
+- Large files are hashed in 64 KiB chunks instead of being read whole.
+
+### Failed builds keep their output
+
+Compiler, linker, and dependency build output went through the progress display,
+which drops it when stderr is not a terminal (piped, redirected, or in CI). A
+failed build then showed only the generic "Failed to run ..." error, whose
+"check the output above" hint pointed at nothing. Child output now bypasses the
+progress display, so the real compiler or linker diagnostic always appears,
+terminal or not.
+
+### Smaller
+
+- Reachable `unwrap`/`expect` calls in CLI editing, manifest parsing, linking,
+  dependency resolution, and git fetching now return errors.
+- Successful non-verbose commands no longer build the joined command string.
+- Dependencies were refreshed.
+
 # v0.4.4
 
 Highlights since 0.4.3.

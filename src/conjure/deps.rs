@@ -118,19 +118,32 @@ fn is_static(name: &str) -> bool {
   name.ends_with(".a") || (cfg!(target_env = "msvc") && name.ends_with(".lib"))
 }
 
-/// Record the first shared and first static library found anywhere under `dir`.
+fn is_ignored_dir(dir: &Path) -> bool {
+  dir
+    .file_name()
+    .and_then(|n| n.to_str())
+    .is_some_and(|n| matches!(n, ".git" | ".hg" | ".svn" | ".conjure"))
+}
+
+/// Record shared/static libraries under `dir`, stopping once the requested
+/// kind is found. Skip VCS metadata and conjure's cache: neither contains final
+/// dependency artifacts. Keep `.libs`, because libtool writes real outputs
+/// there.
 fn collect_libs(
   dir: &Path,
+  want_static: bool,
   shared: &mut Option<PathBuf>,
   statik: &mut Option<PathBuf>,
-) -> Result<()> {
+) -> Result<bool> {
   for entry in fs::read_dir(dir).map_err(|source| ReadPath {
     path: dir.to_path_buf(),
     source,
   })? {
     let p = entry.into_diagnostic()?.path();
     if p.is_dir() {
-      collect_libs(&p, shared, statik)?;
+      if !is_ignored_dir(&p) && collect_libs(&p, want_static, shared, statik)? {
+        return Ok(true);
+      }
     } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
       if shared.is_none() && is_shared(name) {
         *shared = Some(p.clone());
@@ -138,15 +151,19 @@ fn collect_libs(
         *statik = Some(p.clone());
       }
     }
+
+    if (want_static && statik.is_some()) || (!want_static && shared.is_some()) {
+      return Ok(true);
+    }
   }
-  Ok(())
+  Ok(false)
 }
 
 /// Pick the dep's library matching the linkage policy. Deterministic, where a
 /// bare readdir walk would be arbitrary.
 fn find_lib(dir: &Path, want_static: bool) -> Result<PathBuf> {
   let (mut shared, mut statik) = (None, None);
-  collect_libs(dir, &mut shared, &mut statik)?;
+  collect_libs(dir, want_static, &mut shared, &mut statik)?;
 
   match (want_static, statik, shared) {
     (true, Some(p), _) => Ok(p),
@@ -387,7 +404,11 @@ fn resolve_remote(
   url: &str,
   bar: Option<&ProgressBar>,
 ) -> Result<Resolved> {
-  git::ensure_cloned_at(dep_dir.parent().unwrap(), url, name, bar)?;
+  let parent = dep_dir.parent().ok_or_else(|| {
+    miette::miette!("Dependency path has no parent: {}", dep_dir.display())
+  })?;
+
+  git::ensure_cloned_at(parent, url, name, bar)?;
   if let Some(r) = &dep.r#ref {
     git::checkout(dep_dir, r)?;
   }
@@ -429,12 +450,13 @@ fn fetch_remotes(
       .map(|(f, bar)| -> Result<Option<Resolved>> {
         let resolved = match &f.pin {
           Pin::Commit(commit) => {
-            git::ensure_cloned_at(
-              f.dep_dir.parent().unwrap(),
-              &f.url,
-              f.name,
-              Some(bar),
-            )?;
+            let parent = f.dep_dir.parent().ok_or_else(|| {
+              miette::miette!(
+                "Dependency path has no parent: {}",
+                f.dep_dir.display()
+              )
+            })?;
+            git::ensure_cloned_at(parent, &f.url, f.name, Some(bar))?;
             git::checkout(&f.dep_dir, commit)?;
             None
           }
@@ -531,7 +553,11 @@ pub fn local_dep_fingerprint(
   dep: &Dependency,
   cache: &mut fingerprint::FileCache,
 ) -> Result<String> {
-  let dep_dir = parent_dir.join(dep.local.as_ref().expect("Local dep"));
+  let local = dep
+    .local
+    .as_ref()
+    .ok_or_else(|| miette::miette!("Dependency `{name}` is not local"))?;
+  let dep_dir = parent_dir.join(local);
   let kdl = dep_dir.join("conjure.kdl");
 
   if !matches!(dep_build_system(dep, &dep_dir), BuildSystem::Conjure(_)) {
@@ -614,6 +640,8 @@ fn build_conjure_dep<'a>(
     force: false,
     threads: Some(ctx.threads),
     record_state: true,
+    prebuilt_deps: None,
+    obj_namespace: None,
   };
 
   build::build_ctx(&child_ctx, ui)?;
@@ -689,6 +717,7 @@ pub fn build_deps(
   dir: &Path,
   root: &Path,
   profile: Option<&str>,
+  file_cache: &mut fingerprint::FileCache,
 ) -> Result<Vec<PathBuf>> {
   let deps = match &proj.dependencies {
     Some(d) if !d.is_empty() => d,
@@ -712,6 +741,7 @@ pub fn build_deps(
   let key_tag = if want_static { "s" } else { "d" };
   let mut lock = lock::LockFile::load(dir.join("conjure.lock"))?;
   let mut cache = DepCache::load(root);
+  let mut cache_dirty = false;
   let link_deps = !(proj.is_library() && want_static);
 
   // Pass 0: schedule fetches for remote deps that are neither cached nor locked.
@@ -784,7 +814,7 @@ pub fn build_deps(
             profile_name,
             name,
             dep,
-            &mut fingerprint::FileCache::default(),
+            file_cache,
           )?
         );
         match cache.hit(&scope, name, &key) {
@@ -850,24 +880,42 @@ pub fn build_deps(
 
     if let DepWork::Local { key, .. } | DepWork::Remote { key, .. } = &job.work
     {
-      cache.insert(&scope, job.name, key.clone(), lib.clone());
+      cache_dirty |= cache.insert(&scope, job.name, key.clone(), lib.clone());
     }
     libs.push(lib);
   }
 
-  cache.save(root);
+  if cache_dirty {
+    cache.save(root);
+  }
   Ok(libs)
 }
 
-/// Resolve `pkg_config` entries for a project's deps into `(cflags, libs)`.
+/// Resolve `pkg_config` entries for the project and its deps into
+/// `(cflags, libs)`.
 ///
-/// A static library never links dep libraries, so it resolves `--cflags` only
-/// and returns empty libs.
+/// A static library never links libraries, so it resolves `--cflags` only and
+/// returns empty libs.
 pub fn resolve_pkg_config(
   project: &Project,
   dir: &Path,
   root: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
+  let scope = scope_of(root, dir);
+  let want_libs = !(project.is_library() && project.want_static());
+  let want_static = project.want_static();
+  let mut cflags = vec![];
+  let mut libs = vec![];
+
+  if let Some(pkgs) =
+    project.compile.as_ref().and_then(|c| c.pkg_config.as_ref())
+  {
+    let (cf, lb) =
+      run_pkg_config(dir, None, pkgs, want_libs, want_static, None)?;
+    cflags.extend(cf);
+    libs.extend(lb);
+  }
+
   let mut deps: Vec<(&String, &Dependency)> = project
     .dependencies
     .as_ref()
@@ -876,57 +924,78 @@ pub fn resolve_pkg_config(
 
   deps.sort_by(|a, b| a.0.cmp(b.0));
 
-  let scope = scope_of(root, dir);
-  // A static library uses dep cflags but never links dep libs.
-  let want_libs = !(project.is_library() && project.want_static());
-  let mut cflags = vec![];
-  let mut libs = vec![];
-
   for (name, dep) in deps {
     let Some(pkgs) = &dep.pkg_config else {
       continue;
     };
 
     let dep_dir = dep_dir(name, dep, dir, root, &scope);
-    let build_dir = dep_dir.join("build");
-    let pkg_path = std::env::var_os("PKG_CONFIG_PATH")
-      .map(|p| format!("{}:{}", build_dir.display(), p.to_string_lossy()))
-      .unwrap_or_else(|| build_dir.display().to_string());
-
-    let mut cmd = Command::new("pkg-config");
-    cmd
-      .current_dir(dir)
-      .env("PKG_CONFIG_PATH", pkg_path)
-      .arg("--cflags")
-      .arg("--libs");
-    if want_libs {
-      // `--static` only affects `--libs`, so it is requested together.
-      cmd.arg("--libs");
-      if project.want_static() {
-        cmd.arg("--static");
-      }
-    }
-
-    let out = cmd.args(pkgs).output().map_err(|source| {
-      miette::miette!(
-        help = "Install pkg-config, or remove the `pkg_config` field from dependency `{name}`",
-        "Failed to run pkg-config for dependency `{name}` ({pkgs:?}): {source}"
-      )
-    })?;
-
-    miette::ensure!(
-      out.status.success(),
-      help = "Make sure `{pkgs:?}` is installed and on PKG_CONFIG_PATH",
-      "pkg-config failed for dependency `{name}` ({pkgs:?}): {}",
-      String::from_utf8_lossy(&out.stderr),
-    );
-
-    let (cf, lb) = split_cflags_and_libs(&String::from_utf8_lossy(&out.stdout));
+    let (cf, lb) = run_pkg_config(
+      dir,
+      Some(&dep_dir.join("build")),
+      pkgs,
+      want_libs,
+      want_static,
+      Some(name),
+    )?;
     cflags.extend(cf);
     libs.extend(lb);
   }
 
   Ok((cflags, libs))
+}
+
+/// Run `pkg-config` for `pkgs`. A dep's build directory is prepended to
+/// `PKG_CONFIG_PATH` so generated `.pc` files are found; project-level packages
+/// use the ambient search path.
+fn run_pkg_config(
+  dir: &Path,
+  build_dir: Option<&Path>,
+  pkgs: &[String],
+  want_libs: bool,
+  want_static: bool,
+  dep: Option<&str>,
+) -> Result<(Vec<String>, Vec<String>)> {
+  let mut cmd = Command::new("pkg-config");
+  cmd.current_dir(dir).arg("--cflags");
+
+  if let Some(build_dir) = build_dir {
+    let pkg_path = std::env::var_os("PKG_CONFIG_PATH")
+      .map(|p| format!("{}:{}", build_dir.display(), p.to_string_lossy()))
+      .unwrap_or_else(|| build_dir.display().to_string());
+    cmd.env("PKG_CONFIG_PATH", pkg_path);
+  }
+
+  if want_libs {
+    // `--static` only affects `--libs`, so it is requested together.
+    cmd.arg("--libs");
+    if want_static {
+      cmd.arg("--static");
+    }
+  }
+
+  cmd.args(pkgs);
+
+  let what = dep
+    .map(|d| format!("dependency `{d}`"))
+    .unwrap_or_else(|| "the project".to_string());
+
+  let out = cmd.output().map_err(|source| {
+    miette::miette!(
+      help = "Install pkg-config, or remove the offending `pkg_config` field",
+      "Failed to run pkg-config for {what} ({pkgs:?}): {source}"
+    )
+  })?;
+
+  miette::ensure!(
+    out.status.success(),
+    help =
+      "Make sure `{pkgs:?}` is installed and on the pkg-config search path",
+    "pkg-config failed for {what} ({pkgs:?}): {}",
+    String::from_utf8_lossy(&out.stderr),
+  );
+
+  Ok(split_cflags_and_libs(&String::from_utf8_lossy(&out.stdout)))
 }
 
 #[cfg(test)]
@@ -1070,6 +1139,31 @@ mod tests {
       split_cflags_and_libs("-I/inc -O2 -L/lib -lz -Wl,-rpath,/x -pthread");
     assert_eq!(cflags, vec!["-I/inc", "-O2"]);
     assert_eq!(libs, vec!["-L/lib", "-lz", "-Wl,-rpath,/x", "-pthread"]);
+  }
+
+  #[test]
+  fn find_lib_skips_vcs_metadata_but_keeps_libtool_outputs() {
+    let dir = std::env::temp_dir()
+      .join(format!("conjure_lib_dirs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join(".libs")).unwrap();
+
+    let shared = match () {
+      _ if cfg!(windows) => "x.dll",
+      _ if cfg!(target_os = "macos") => "libx.dylib",
+      _ => "libx.so",
+    };
+
+    std::fs::write(dir.join(".git").join(shared), "").unwrap();
+    std::fs::write(dir.join(".libs").join(shared), "").unwrap();
+
+    assert_eq!(
+      find_lib(&dir, false).unwrap(),
+      dir.join(".libs").join(shared)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]

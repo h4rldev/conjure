@@ -15,6 +15,7 @@
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::{
+  borrow::Cow,
   collections::{HashMap, HashSet},
   fs,
   path::{Path, PathBuf},
@@ -190,7 +191,7 @@ impl std::fmt::Display for BuildSystem {
       }
       BuildSystem::Just(_target) => write!(f, "just"),
       BuildSystem::Custom(cmd) => {
-        let cmd_executable = cmd.split_whitespace().next().unwrap();
+        let cmd_executable = cmd.split_whitespace().next().unwrap_or_default();
         write!(f, "custom ({})", cmd_executable)
       }
     }
@@ -300,9 +301,16 @@ pub struct Compile {
   #[serde(default)]
   pub ld_flags: Option<Flags>,
   #[serde(default)]
+  pub pkg_config: Option<Vec<String>>,
+  #[serde(default)]
   pub threads: Option<usize>,
   #[serde(default)]
   pub arch: Option<Arch>,
+  /// MSVC shared libraries only export `__declspec(dllexport)` symbols. When
+  /// set, every external object symbol gets a generated `.def`, matching the
+  /// default-visible API a library has on ELF/Mach-O. Ignored elsewhere.
+  #[serde(default, deserialize_with = "de_kdl_bool")]
+  pub export_all: Option<bool>,
 }
 
 impl Compile {
@@ -328,8 +336,10 @@ impl Compile {
       src: merge_flags(self.src.as_ref(), p.src.as_ref()),
       c_flags: merge_flags(self.c_flags.as_ref(), p.c_flags.as_ref()),
       ld_flags: merge_flags(self.ld_flags.as_ref(), p.ld_flags.as_ref()),
+      pkg_config: p.pkg_config.clone().or_else(|| self.pkg_config.clone()),
       threads: p.threads.or(self.threads),
       arch: p.arch.or(self.arch),
+      export_all: p.export_all.or(self.export_all),
     }
   }
 }
@@ -361,8 +371,25 @@ pub struct Output {
   pub bin: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub lib: Option<String>,
+  /// Literal artifact filename written straight into `bin`/`lib`, bypassing the
+  /// platform prefix and the `<project>/<profile>` scoping. For plugin artifacts
+  /// loaded by exact name (Erlang NIFs, extension modules).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub name: Option<String>,
   #[serde(default, deserialize_with = "de_kdl_bool")]
   pub symlink_binaries: Option<bool>,
+}
+
+impl Output {
+  /// Fold `over` over these: each field set in `over` wins.
+  fn merged(self, over: &Output) -> Output {
+    Output {
+      bin: over.bin.clone().or(self.bin),
+      lib: over.lib.clone().or(self.lib),
+      name: over.name.clone().or(self.name),
+      symlink_binaries: over.symlink_binaries.or(self.symlink_binaries),
+    }
+  }
 }
 
 #[derive(Deserialize, Clone, Default, Serialize, Debug)]
@@ -512,6 +539,8 @@ pub struct Profile {
   #[serde(default)]
   pub generate_pc: Option<GeneratePc>,
   #[serde(default)]
+  pub output: Option<Output>,
+  #[serde(default)]
   pub cc: Option<String>,
   #[serde(default)]
   pub linker: Option<String>,
@@ -526,9 +555,13 @@ pub struct Profile {
   #[serde(default)]
   pub ld_flags: Option<Flags>,
   #[serde(default)]
+  pub pkg_config: Option<Vec<String>>,
+  #[serde(default)]
   pub threads: Option<usize>,
   #[serde(default)]
   pub arch: Option<Arch>,
+  #[serde(default, deserialize_with = "de_kdl_bool")]
+  pub export_all: Option<bool>,
   #[serde(default)]
   pub tests: Option<HashMap<String, Test>>,
   #[serde(default)]
@@ -548,20 +581,31 @@ impl Profile {
     self.linker = other.linker.clone().or(self.linker);
     self.standard = other.standard.clone().or(self.standard);
     self.arch = other.arch.or(self.arch);
+    self.export_all = other.export_all.or(self.export_all);
     self.threads = other.threads.or(self.threads);
     self.artifact = other.artifact.clone().or(self.artifact);
     self.generate_pc =
       merge_generate_pc(self.generate_pc, other.generate_pc.as_ref());
+    self.output = merge_output(self.output, other.output.as_ref());
     self.include = merge_flags(self.include.as_ref(), other.include.as_ref());
     self.src = merge_flags(self.src.as_ref(), other.src.as_ref());
     self.c_flags = merge_flags(self.c_flags.as_ref(), other.c_flags.as_ref());
     self.ld_flags =
       merge_flags(self.ld_flags.as_ref(), other.ld_flags.as_ref());
+    self.pkg_config = other.pkg_config.clone().or(self.pkg_config);
     self.tests = merge_map(self.tests.as_ref(), other.tests.as_ref());
     self.dependencies =
       merge_map(self.dependencies.as_ref(), other.dependencies.as_ref());
     self.extends = None;
     self
+  }
+}
+
+/// Fold an `output` block over a base one, field by field.
+fn merge_output(base: Option<Output>, over: Option<&Output>) -> Option<Output> {
+  match (base, over) {
+    (Some(base), Some(over)) => Some(base.merged(over)),
+    (base, over) => base.or_else(|| over.cloned()),
   }
 }
 
@@ -725,6 +769,149 @@ where
   d.deserialize_option(V)
 }
 
+/// Rewrite bare `true`/`false` values to KDL v2 keywords.
+///
+/// KDL v2 reserves those words (`#true`/`#false` are the keywords), so writing
+/// `symlink_binaries true` is a syntax error even though bare identifiers are
+/// the norm everywhere else in the manifest. This rewrite runs before parsing
+/// and skips strings and comments; a `true` inside either is left untouched.
+fn normalize_bare_bools(input: &str) -> Cow<'_, str> {
+  if !input.contains("true") && !input.contains("false") {
+    return Cow::Borrowed(input);
+  }
+
+  /// KDL identifier characters, including `#` so `#true` stays one token.
+  fn token_char(c: char) -> bool {
+    !(c.is_whitespace()
+      || matches!(
+        c,
+        '\\' | '/' | '(' | ')' | '{' | '}' | '[' | ']' | ';' | '"' | '='
+      ))
+  }
+
+  let chars: Vec<char> = input.chars().collect();
+  let mut out = String::with_capacity(input.len() + 8);
+  let mut i = 0;
+  while i < chars.len() {
+    let c = chars[i];
+
+    if c == '/' && chars.get(i + 1) == Some(&'/') {
+      while i < chars.len() && chars[i] != '\n' {
+        out.push(chars[i]);
+        i += 1;
+      }
+      continue;
+    }
+
+    if c == '/' && chars.get(i + 1) == Some(&'*') {
+      let mut depth = 0;
+      while i < chars.len() {
+        match (chars[i], chars.get(i + 1)) {
+          ('/', Some('*')) => {
+            depth += 1;
+            out.push('/');
+            out.push('*');
+            i += 2;
+          }
+          ('*', Some('/')) => {
+            depth -= 1;
+            out.push('*');
+            out.push('/');
+            i += 2;
+            if depth == 0 {
+              break;
+            }
+          }
+          (c, _) => {
+            out.push(c);
+            i += 1;
+          }
+        }
+      }
+      continue;
+    }
+
+    if c == '#' {
+      let hashes = chars[i..].iter().take_while(|&&c| c == '#').count();
+      if chars.get(i + hashes) == Some(&'"') {
+        for _ in 0..=hashes {
+          out.push(chars[i]);
+          i += 1;
+        }
+        while i < chars.len() {
+          if chars[i] == '"'
+            && chars[i + 1..]
+              .iter()
+              .take(hashes)
+              .filter(|&&c| c == '#')
+              .count()
+              == hashes
+          {
+            for _ in 0..=hashes {
+              out.push(chars[i]);
+              i += 1;
+            }
+            break;
+          }
+          out.push(chars[i]);
+          i += 1;
+        }
+        continue;
+      }
+    }
+
+    if c == '"' {
+      let triple =
+        chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'"');
+      for _ in 0..if triple { 3 } else { 1 } {
+        out.push('"');
+        i += 1;
+      }
+      while i < chars.len() {
+        if chars[i] == '\\' {
+          out.push('\\');
+          i += 1;
+          if let Some(&c) = chars.get(i) {
+            out.push(c);
+            i += 1;
+          }
+        } else if chars[i] == '"'
+          && (!triple
+            || (chars.get(i + 1) == Some(&'"')
+              && chars.get(i + 2) == Some(&'"')))
+        {
+          for _ in 0..if triple { 3 } else { 1 } {
+            out.push('"');
+            i += 1;
+          }
+          break;
+        } else {
+          out.push(chars[i]);
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if token_char(c) {
+      let start = i;
+      while i < chars.len() && token_char(chars[i]) {
+        i += 1;
+      }
+      let token: String = chars[start..i].iter().collect();
+      if token == "true" || token == "false" {
+        out.push('#');
+      }
+      out.push_str(&token);
+      continue;
+    }
+
+    out.push(c);
+    i += 1;
+  }
+  Cow::Owned(out)
+}
+
 /// Node names whose arguments are flags or paths. A `name=value` argument under
 /// one of these is parsed by KDL as a node property and never reaches the field,
 /// so reject it with a quoting hint instead of dropping it silently. This is how
@@ -797,8 +984,11 @@ fn reject_unquoted_eq_flags(input: &str) -> Result<(), Error> {
 ///     include: [string] (include dirs, each becomes -I<dir>)
 ///     c_flags: [string]
 ///     ld_flags: [string]
+///     pkg_config: [string] (system packages resolved via pkg-config for cflags/libs)
 ///     threads: int (parallelism for compiling and dep builds)
 ///     arch: string (native | x86 | x64 | arm64; default native)
+///     export_all: bool (MSVC only: export every external symbol from a shared
+///       library via a generated `.def`; default false)
 ///   }
 ///
 ///   siblings {
@@ -981,6 +1171,7 @@ impl Project {
 
     out.generate_pc =
       merge_generate_pc(out.generate_pc, p.generate_pc.as_ref());
+    out.output = merge_output(out.output, p.output.as_ref());
 
     out.compile = Some(out.compile.clone().unwrap_or_default().with_profile(p));
     if let Some(deps) = &p.dependencies {
@@ -1035,8 +1226,9 @@ impl Project {
 
   /// Parse and validate a manifest.      ld_flags -lxkbcommon -lxkbcommon-x11 -lxcb -lxcb-cursor -lxcb-icccm -lxcb-randr -lbread-x11-release -lhtils -lvulkan -ldl
   pub fn from_str(input: &str) -> Result<Self, Error> {
-    reject_unquoted_eq_flags(input)?;
-    let mut project: Project = kdl::de::from_str::<ProjectKDL>(input)?.project;
+    let input = normalize_bare_bools(input);
+    reject_unquoted_eq_flags(&input)?;
+    let mut project: Project = kdl::de::from_str::<ProjectKDL>(&input)?.project;
     if let Some(deps) = &project.dependencies {
       for (name, dep) in deps {
         dep.validate().map_err(|e| {
@@ -1135,6 +1327,27 @@ mod tests {
 
   fn parse(src: &str) -> Project {
     Project::from_str(src).expect("should parse")
+  }
+
+  #[test]
+  fn compile_pkg_config_is_profile_mergeable() {
+    let project = parse(
+      "project {\n  name t\n  language c\n  type library\n  compile {\n    pkg_config \"base\"\n  }\n  profiles {\n    prod {\n      pkg_config \"zstd\"\n    }\n  }\n}\n",
+    );
+    let p = project.profiles.as_ref().unwrap().get("prod").unwrap();
+    let compile = project.with_profile(Some(p)).compile.unwrap();
+    assert_eq!(compile.pkg_config, Some(vec!["zstd".to_string()]));
+  }
+
+  #[test]
+  fn with_profile_merges_output() {
+    let project = parse(
+      "project {\n  name t\n  language c\n  type library\n  output {\n    lib \"priv\"\n  }\n  profiles {\n    prod {\n      output {\n        name \"t.so\"\n      }\n    }\n  }\n}\n",
+    );
+    let p = project.profiles.as_ref().unwrap().get("prod").unwrap();
+    let out = project.with_profile(Some(p)).output.unwrap();
+    assert_eq!(out.lib.as_deref(), Some("priv"));
+    assert_eq!(out.name.as_deref(), Some("t.so"));
   }
 
   #[test]
@@ -1245,6 +1458,16 @@ mod tests {
   }
 
   #[test]
+  fn export_all_is_profile_mergeable() {
+    let project = parse(
+      "project {\n  name t\n  language c\n  type library\n  compile {\n    export_all false\n  }\n  profiles {\n    prod {\n      export_all true\n    }\n  }\n}\n",
+    );
+    let p = project.profiles.as_ref().unwrap().get("prod").unwrap();
+    let compile = project.with_profile(Some(p)).compile.unwrap();
+    assert_eq!(compile.export_all, Some(true));
+  }
+
+  #[test]
   fn with_profile_none_is_identity() {
     let project =
       parse("project {\n  name t\n  language c\n  type library\n}\n");
@@ -1347,23 +1570,41 @@ mod tests {
   }
 
   #[test]
-  fn output_symlink_bool_accepts_kdl_and_quoted_forms() {
-    for value in ["#true", "\"true\""] {
+  fn output_symlink_bool_accepts_all_boolean_forms() {
+    for (value, expected) in [
+      ("#true", true),
+      ("true", true),
+      ("\"true\"", true),
+      ("#false", false),
+      ("false", false),
+      ("\"false\"", false),
+    ] {
       let src = format!(
         "project {{\n  name t\n  language c\n  type binary\n  output {{\n    symlink_binaries {value}\n  }}\n}}"
       );
       assert_eq!(
         parse(&src).output.unwrap().symlink_binaries,
-        Some(true),
+        Some(expected),
         "{value}"
       );
     }
 
-    let src = "project {\n  name t\n  language c\n  type binary\n  output {\n    symlink_binaries #false\n  }\n}";
-    assert_eq!(parse(src).output.unwrap().symlink_binaries, Some(false));
-
     let src = "project {\n  name t\n  language c\n  type binary\n  output {\n    bin \"out\"\n  }\n}";
     assert_eq!(parse(src).output.unwrap().symlink_binaries, None);
+  }
+
+  #[test]
+  fn bare_bool_normalizer_skips_strings_and_comments() {
+    let src = "a \"true\" b #\"false\"# c #true d .true e trueish f false";
+    assert_eq!(
+      normalize_bare_bools(src).as_ref(),
+      "a \"true\" b #\"false\"# c #true d .true e trueish f #false"
+    );
+
+    let src = "project {\n  name t\n  language c\n  type binary\n  // true stays\n  /* false stays */\n  output {\n    bin \"true\"\n    symlink_binaries false\n  }\n}";
+    let out = parse(src).output.unwrap();
+    assert_eq!(out.bin.as_deref(), Some("true"));
+    assert_eq!(out.symlink_binaries, Some(false));
   }
 
   #[test]

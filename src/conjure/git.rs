@@ -81,7 +81,13 @@ fn fetch(ui: Option<&Ui>, url: &str, dir: &Path) -> Result<()> {
   let pb = ui.map(|u| {
     u.bar(
       0,
-      format!("Fetching {}", dir.file_name().unwrap().to_string_lossy()),
+      format!(
+        "Fetching {}",
+        dir.file_name().map_or_else(
+          || dir.display().to_string(),
+          |n| n.to_string_lossy().into_owned()
+        )
+      ),
       "objects",
     )
   });

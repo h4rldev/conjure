@@ -28,9 +28,10 @@ use super::{
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, HashSet},
   fs,
   hash::{DefaultHasher, Hash, Hasher},
+  io::Read,
   path::{Path, PathBuf},
   time::UNIX_EPOCH,
 };
@@ -87,13 +88,25 @@ fn mtime_nanos(md: &fs::Metadata) -> i64 {
 
 /// Content hash of a file. `DefaultHasher` is fixed-key (not randomized), so the
 /// hash is stable across runs; it detects change, it is not a security hash.
-fn hash_file(path: &Path) -> Result<u64> {
-  let bytes = fs::read(path).map_err(|source| ReadPath {
+fn hash_file(path: &Path, size: u64) -> Result<u64> {
+  let mut file = fs::File::open(path).map_err(|source| ReadPath {
     path: path.to_path_buf(),
     source,
   })?;
+
   let mut h = DefaultHasher::new();
-  bytes.hash(&mut h);
+  (size as usize).hash(&mut h);
+  let mut buf = [0u8; 64 * 1024];
+  loop {
+    let n = file.read(&mut buf).map_err(|source| ReadPath {
+      path: path.to_path_buf(),
+      source,
+    })?;
+    if n == 0 {
+      break;
+    }
+    h.write(&buf[..n]);
+  }
   Ok(h.finish())
 }
 
@@ -115,18 +128,20 @@ fn file_fingerprint_inner(
         source,
       })?
     };
+
     let size = md.len();
     let mtime = mtime_nanos(&md);
     let hash = match cache.files.get(path) {
       Some(entry) if entry.size == size && entry.mtime == mtime => entry.hash,
       _ => {
-        let hash = hash_file(path)?;
+        let hash = hash_file(path, size)?;
         cache
           .files
           .insert(path.clone(), FileEntry { size, mtime, hash });
         hash
       }
     };
+
     out.push(format!("file:{}:{hash:016x}", path.display()));
   }
   out.sort();
@@ -225,6 +240,10 @@ pub fn fingerprint(
     items.push(format!("arch:{arch:?}"));
   }
 
+  if compile.export_all.unwrap_or(false) {
+    items.push("export-all".into());
+  }
+
   if let Some(inc) = &compile.include {
     items.extend(inc.list());
   }
@@ -250,7 +269,15 @@ pub fn fingerprint(
   }
   items.extend(file_fingerprint(cache, &sources)?);
 
-  if let Some(include) = &compile.include {
+  let dep_graph = super::incremental::DepGraph::load(dir, profile_name);
+  let dep_files = dep_graph.files();
+
+  // Depfiles name the headers actually included. Walk the include dirs only
+  // before the first depfile record exists; after that the per-object graph
+  // already covers header changes.
+  if dep_graph.objects.is_empty()
+    && let Some(include) = &compile.include
+  {
     for inc in include.list() {
       let mut files = vec![];
       find_sources(&dir.join(inc), &[], &mut files)?;
@@ -258,9 +285,7 @@ pub fn fingerprint(
     }
   }
 
-  let dep_files = super::incremental::DepGraph::load(dir, profile_name).files();
   items.extend(file_fingerprint_opt(cache, &dep_files)?);
-
   if let Some(deps) = &project.dependencies {
     let mut entries: Vec<(&String, &Dependency)> = deps.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -281,13 +306,70 @@ pub fn fingerprint(
   Ok(items.join("|"))
 }
 
+/// The path in a `file:path:hash` fingerprint item.
+fn file_entry_path(item: &str) -> Option<&Path> {
+  let rest = item.strip_prefix("file:")?;
+  let (path, _) = rest.rsplit_once(':')?;
+  Some(Path::new(path))
+}
+
+/// Swap the depfile block in `fingerprint` for `new_dep_files`.
+///
+/// The source and dependency portions are unchanged, so this avoids walking
+/// the source tree and re-fingerprinting local dependencies after a compile.
+/// `None` means the old depfile entries were not one contiguous block (for
+/// example a first build, or a file that is both a source and a depfile);
+/// the caller then re-fingerprints from scratch.
+pub fn replace_depfiles(
+  fingerprint: &str,
+  old_dep_files: &[PathBuf],
+  new_dep_files: &[PathBuf],
+  cache: &mut FileCache,
+) -> Result<Option<String>> {
+  if old_dep_files.is_empty() {
+    return Ok(None);
+  }
+
+  let old: HashSet<&Path> =
+    old_dep_files.iter().map(PathBuf::as_path).collect();
+  let items: Vec<&str> = fingerprint.split('|').collect();
+  let mut first = None;
+  let mut last = 0;
+  let mut count = 0;
+  for (i, item) in items.iter().enumerate() {
+    if file_entry_path(item).is_some_and(|path| old.contains(path)) {
+      first.get_or_insert(i);
+      last = i;
+      count += 1;
+    }
+  }
+
+  let Some(first) = first else {
+    return Ok(None);
+  };
+  if last + 1 - first != count {
+    return Ok(None);
+  }
+
+  let new_entries = file_fingerprint_opt(cache, new_dep_files)?;
+  let mut out = Vec::with_capacity(items.len() + new_entries.len());
+  out.extend_from_slice(&items[..first]);
+  out.extend(new_entries.iter().map(String::as_str));
+  out.extend_from_slice(&items[last + 1..]);
+  Ok(Some(out.join("|")))
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{FileCache, fingerprint, split};
+  use super::{FileCache, fingerprint, hash_file, replace_depfiles, split};
   use crate::conjure::proj_parse::{
     Arch, Compile, Dependency, Flags, Language, Project,
   };
-  use std::{collections::HashMap, path::Path};
+  use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
+  };
 
   fn local_dep(path: &str) -> Dependency {
     Dependency {
@@ -461,12 +543,75 @@ mod tests {
   }
 
   #[test]
+  fn streamed_hash_matches_in_memory_hash() {
+    let path =
+      std::env::temp_dir().join(format!("conjure_hash_{}", std::process::id()));
+    let bytes = b"hello world";
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut expected = DefaultHasher::new();
+    bytes.to_vec().hash(&mut expected);
+
+    assert_eq!(
+      hash_file(&path, bytes.len() as u64).unwrap(),
+      expected.finish()
+    );
+    let _ = std::fs::remove_file(&path);
+  }
+
+  #[test]
   fn split_separates_file_lines() {
     let fp = "default|cc|file:/a/x.c:00000000000000ff|file:/a/y.c:00000000000000aa|Append([\"-O2\"])";
     let (base, files) = split(fp);
     assert_eq!(base, "default|cc|Append([\"-O2\"])");
     assert_eq!(files.get(Path::new("/a/x.c")), Some(&0xff));
     assert_eq!(files.get(Path::new("/a/y.c")), Some(&0xaa));
+  }
+
+  #[test]
+  fn replace_depfiles_swaps_only_the_depfile_block() {
+    let dir = std::env::temp_dir()
+      .join(format!("conjure_replace_depfiles_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.h");
+    let keep = dir.join("keep.h");
+    let new = dir.join("new.h");
+    std::fs::write(&old, "old").unwrap();
+    std::fs::write(&keep, "keep").unwrap();
+    std::fs::write(&new, "new").unwrap();
+
+    let source = dir.join("source.c");
+    let fp = format!(
+      "profile|file:{}:{:016x}|file:{}:{:016x}|file:{}:{:016x}|deps",
+      source.display(),
+      1u64,
+      old.display(),
+      2u64,
+      keep.display(),
+      3u64,
+    );
+    let mut cache = FileCache::default();
+    let replaced = replace_depfiles(
+      &fp,
+      &[old.clone(), keep.clone()],
+      &[keep.clone(), new.clone()],
+      &mut cache,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(split(&fp).0, split(&replaced).0);
+    let new_text = new.display().to_string();
+    let old_text = old.display().to_string();
+    let source_text = source.display().to_string();
+    assert!(replaced.contains(new_text.as_str()));
+    assert!(!replaced.contains(old_text.as_str()));
+    assert!(replaced.contains(source_text.as_str()));
+
+    let files = split(&replaced).1;
+    assert!(files.contains_key(&keep));
+    assert!(files.contains_key(&new));
+    assert!(!files.contains_key(&old));
   }
 
   #[test]

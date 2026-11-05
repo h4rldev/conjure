@@ -23,6 +23,7 @@ use super::{
   ui::{StepStatus, Ui},
 };
 use miette::{IntoDiagnostic, Result};
+use rayon::prelude::*;
 use std::{
   collections::{BTreeSet, HashSet},
   fs,
@@ -41,6 +42,14 @@ pub struct BuildCtx<'a> {
   /// the project does not define falls back to default (see `build_ctx`).
   pub profile: Option<&'a str>,
   pub record_state: bool,
+  /// Dependency libraries already built by the caller. Test targets set this
+  /// after one shared `build_deps` call so their parallel builds do no
+  /// dependency work and touch no cache.
+  pub prebuilt_deps: Option<&'a [PathBuf]>,
+  /// Extra path component under `.conjure/build/obj/<profile>/`. Test targets
+  /// set their name so parallel tests compiling a shared source get distinct
+  /// objects instead of racing on one file.
+  pub obj_namespace: Option<&'a str>,
   pub force: bool,
   pub threads: Option<usize>,
 }
@@ -128,7 +137,7 @@ fn plan_compile(
           .get(obj)
           .is_none_or(|deps| deps.iter().any(|d| changed.contains(d)));
         (!obj.exists()
-          || changed.contains(&PathBuf::from(entry.source()))
+          || changed.contains(Path::new(entry.source()))
           || dep_changed)
           .then_some(i)
       })
@@ -193,8 +202,6 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     &mut file_cache,
   )?;
 
-  file_cache.save(&ctx.dir);
-
   let state_file = ctx.dir.join(".conjure/build/state.kdl");
   let previous = fs::read_to_string(&state_file).unwrap_or_default();
   let artifact = built_artifact(&project, &ctx.dir, &ctx.root, profile_name);
@@ -209,8 +216,23 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     return Ok(());
   }
 
-  let dep_libs =
-    deps::build_deps(ui, &project, &ctx.dir, &ctx.root, ctx.profile)?;
+  // Only persist when the build continues. An up-to-date run changed no cache
+  // entry, so rewriting fingerprint.kdl is pure churn.
+  if ctx.record_state {
+    file_cache.save(&ctx.dir);
+  }
+
+  let dep_libs = match ctx.prebuilt_deps {
+    Some(libs) => libs.to_vec(),
+    None => deps::build_deps(
+      ui,
+      &project,
+      &ctx.dir,
+      &ctx.root,
+      ctx.profile,
+      &mut file_cache,
+    )?,
+  };
 
   let (pkg_cflags, pkg_libs) = match early_pkg {
     Some(resolved) => resolved,
@@ -234,6 +256,7 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     &ctx.root,
     &project,
     profile_name,
+    ctx.obj_namespace,
     pkg_cflags.clone(),
     true,
   )?;
@@ -270,12 +293,16 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
     let selected: Vec<CompileEntry> = entries
       .into_iter()
       .enumerate()
-      .filter_map(|(i, (_, entry))| plan.compile.contains(&i).then_some(entry))
+      // `plan.compile` is ascending: `all` or an enumerate filter.
+      .filter_map(|(i, (_, entry))| {
+        plan.compile.binary_search(&i).is_ok().then_some(entry)
+      })
       .collect();
     compile::compile(ui, &ctx.dir, selected, threads, tc.env())?;
   }
 
   if ctx.record_state && !compiled.is_empty() {
+    let old_dep_files = deps_graph.files();
     for obj in &compiled {
       let (depfile, _) = tc.depfile(&obj.display().to_string());
       if let Ok(text) = fs::read_to_string(&depfile) {
@@ -285,21 +312,32 @@ pub fn build_ctx(ctx: &BuildCtx, ui: &Ui) -> Result<()> {
         let _ = fs::remove_file(&depfile);
       }
     }
+
     let current: HashSet<&PathBuf> = objects.iter().collect();
     deps_graph.objects.retain(|obj, _| current.contains(obj));
     deps_graph.save(&ctx.dir, profile_name);
 
-    // The graph now names this build's headers, and `fingerprint` hashes them,
-    // so re-key with it; otherwise the next run sees a dep-file delta and
-    // rebuilds once more.
-    fp = fingerprint::fingerprint(
-      &project,
-      &ctx.dir,
-      profile_name,
-      &dep_commits.iter().map(String::as_str).collect::<Vec<_>>(),
-      &pkg_cflags,
+    let new_dep_files = deps_graph.files();
+    // Only the depfile block changed during the compile. Replacing it keeps
+    // the earlier source and local-dependency hashes; fall back to a full
+    // fingerprint when the old block cannot be located.
+    fp = match fingerprint::replace_depfiles(
+      &fp,
+      &old_dep_files,
+      &new_dep_files,
       &mut file_cache,
-    )?;
+    )? {
+      Some(replaced) => replaced,
+      None => fingerprint::fingerprint(
+        &project,
+        &ctx.dir,
+        profile_name,
+        &dep_commits.iter().map(String::as_str).collect::<Vec<_>>(),
+        &pkg_cflags,
+        &mut file_cache,
+      )?,
+    };
+
     file_cache.save(&ctx.dir);
   }
 
@@ -395,6 +433,7 @@ pub fn test_project(
     output: Some(Output {
       bin: Some(output_bin),
       lib: None,
+      name: None,
       symlink_binaries: output.and_then(|o| o.symlink_binaries),
     }),
     ..Default::default()
@@ -420,6 +459,8 @@ pub fn build(
       force,
       threads,
       record_state: true,
+      prebuilt_deps: None,
+      obj_namespace: None,
     },
     &ui,
   )?;
@@ -445,6 +486,8 @@ pub fn build(
           force,
           threads,
           record_state: true,
+          prebuilt_deps: None,
+          obj_namespace: None,
         },
         &ui,
       )?;
@@ -487,23 +530,53 @@ pub fn test(
     .collect();
   selected.sort_by(|a, b| a.0.cmp(b.0));
 
-  for (name, target) in selected {
-    // `test_project` stays on the *raw* parent so `build_ctx` applies the
-    // profile once; it only uses `effective` for the tests lookup and the
-    // library check.
-    let child = test_project(project, name, target, profile)?;
-    build_ctx(
-      &BuildCtx {
-        project: &child,
-        dir: cwd.clone(),
-        root: cwd.clone(),
-        profile,
-        force: false,
-        threads,
-        record_state: false,
-      },
-      &ui,
-    )?;
+  // Every target links the same dependency set. Resolve it once here:
+  // `build_deps` builds the parent and writes the dep cache/lock, which must
+  // not race with the target builds.
+  let mut dep_libs = Vec::new();
+  if let Some(&(name, target)) = selected.first() {
+    let probe = test_project(project, name, target, profile)?;
+    let mut dep_cache = fingerprint::FileCache::load(&cwd);
+    dep_libs =
+      deps::build_deps(&ui, &probe, &cwd, &cwd, profile, &mut dep_cache)?;
+    dep_cache.save(&cwd);
   }
+
+  // `threads` is a total budget, not a per-target one: the outer loop and each
+  // target's inner compile pool would otherwise multiply into `tests x cores`.
+  let total = threads.unwrap_or_else(|| {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+  });
+
+  let targets = selected.len().max(1);
+  let workers = total.min(targets);
+  let per_test = (total / targets).max(1);
+  let pool = rayon::ThreadPoolBuilder::new()
+    .num_threads(workers)
+    .build()
+    .into_diagnostic()?;
+
+  pool.install(|| {
+    selected.par_iter().try_for_each(|&(name, target)| {
+      // `test_project` stays on the *raw* parent so `build_ctx` applies the
+      // profile once; it only uses `effective` for the tests lookup and the
+      // library check.
+      let child = test_project(project, name, target, profile)?;
+      build_ctx(
+        &BuildCtx {
+          project: &child,
+          dir: cwd.clone(),
+          root: cwd.clone(),
+          profile,
+          force: false,
+          threads: Some(per_test),
+          record_state: false,
+          prebuilt_deps: Some(&dep_libs),
+          obj_namespace: Some(name.as_str()),
+        },
+        &ui,
+      )
+    })
+  })?;
   Ok(())
 }

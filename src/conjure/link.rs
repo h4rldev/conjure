@@ -208,6 +208,13 @@ fn write_pkg_config(
         .cloned(),
     );
   }
+
+  if let Some(pkgs) =
+    project.compile.as_ref().and_then(|c| c.pkg_config.as_ref())
+  {
+    requires.extend(pkgs.iter().cloned());
+  }
+
   requires.sort();
   requires.dedup();
   if !requires.is_empty() {
@@ -432,13 +439,12 @@ fn link_binary(
     .out
     .strip_prefix(target.dir)
     .unwrap_or(target.out)
-    .to_str()
-    .unwrap();
+    .to_string_lossy();
   let spec = LinkSpec {
     ui,
     tc,
     dir: target.dir,
-    out,
+    out: &out,
     what: target.out.display().to_string(),
     kind: LinkKind::Binary { is_static },
   };
@@ -470,13 +476,12 @@ fn link_shared(
     .out
     .strip_prefix(target.dir)
     .unwrap_or(target.out)
-    .to_str()
-    .unwrap();
+    .to_string_lossy();
   let spec = LinkSpec {
     ui,
     tc,
     dir: target.dir,
-    out,
+    out: &out,
     what: target.out.display().to_string(),
     kind: LinkKind::Shared,
   };
@@ -486,7 +491,12 @@ fn link_shared(
     .as_deref()
     .filter(|s| !s.trim().is_empty());
 
-  run_link(&spec, inputs, inputs.ld_flags, configured)
+  let mut flags = inputs.ld_flags.to_vec();
+  if inputs.compile.export_all.unwrap_or(false) {
+    flags.extend(tc.export_all_args(target.dir, inputs.objects, target.out)?);
+  }
+
+  run_link(&spec, inputs, &flags, configured)
 }
 
 /// Whether artifact paths include the project-name level. True when other
@@ -503,18 +513,23 @@ pub fn binary_path(
   scoped: bool,
 ) -> PathBuf {
   let output = project.output.as_ref();
-  let mut out_dir =
-    root.join(output.and_then(|o| o.bin.as_deref()).unwrap_or("bin"));
+  let bin = output.and_then(|o| o.bin.as_deref()).unwrap_or("bin");
+  if let Some(name) = output.and_then(|o| o.name.as_deref()) {
+    return root.join(bin).join(name);
+  }
+  let mut out_dir = root.join(bin);
   if scoped {
     out_dir = out_dir.join(&project.name);
   }
+
   out_dir
     .join(profile_name)
     .join(binary_file_name(project.artifact_name()))
 }
 
-/// The exact library path [`produce`] writes, honoring `output.lib`. The archive
-/// name depends on the toolchain (`.a` vs `.lib`), so this resolves the driver.
+/// The exact library path [`produce`] writes, honoring `output.lib` and
+/// `output.name`. The archive name depends on the toolchain (`.a` vs `.lib`),
+/// so this resolves the driver.
 pub fn library_path(
   project: &Project,
   root: &Path,
@@ -522,8 +537,11 @@ pub fn library_path(
   scoped: bool,
 ) -> PathBuf {
   let output = project.output.as_ref();
-  let mut out_dir =
-    root.join(output.and_then(|o| o.lib.as_deref()).unwrap_or("lib"));
+  let lib_dir = output.and_then(|o| o.lib.as_deref()).unwrap_or("lib");
+  if let Some(name) = output.and_then(|o| o.name.as_deref()) {
+    return root.join(lib_dir).join(name);
+  }
+  let mut out_dir = root.join(lib_dir);
 
   if scoped {
     out_dir = out_dir.join(&project.name);
@@ -579,10 +597,10 @@ pub fn produce(
       let lib = library_path(project, root, profile_name, scoped);
       fs::create_dir_all(lib.parent().unwrap()).into_diagnostic()?;
       let rel_lib = lib.strip_prefix(dir).unwrap_or(&lib);
-      let rel = rel_lib.to_str().unwrap();
+      let rel = rel_lib.to_string_lossy();
       let objects: Vec<&str> =
         inputs.objects.iter().filter_map(|p| p.to_str()).collect();
-      for (header, argv) in tc.archive(rel, &objects) {
+      for (header, argv) in tc.archive(&rel, &objects) {
         ui.run_step_env(
           format!("{header} {}", lib.display()),
           dir,
@@ -661,7 +679,7 @@ mod tests {
   use super::{
     super::{
       link::output_scoped,
-      proj_parse::{Linkage, Project, ProjectType, Sibling},
+      proj_parse::{Linkage, Output, Project, ProjectType, Sibling},
       toolchain::{self, Gnu, Microsoft, Toolchain},
     },
     binary_file_name, library_path, shared_file_name,
@@ -914,5 +932,22 @@ mod tests {
 
     assert!(file.contains("foo"));
     assert!(file.ends_with(".a") || file.ends_with(".lib"));
+  }
+
+  #[test]
+  fn output_name_is_literal_and_unscoped() {
+    let mut project = Project {
+      name: "nif".into(),
+      ty: ProjectType::Library,
+      ..Default::default()
+    };
+    project.output = Some(Output {
+      lib: Some("priv".into()),
+      name: Some("errm_http_magic_nif.so".into()),
+      ..Default::default()
+    });
+
+    let p = library_path(&project, Path::new("/root"), "prod", true);
+    assert_eq!(p, Path::new("/root/priv/errm_http_magic_nif.so"));
   }
 }

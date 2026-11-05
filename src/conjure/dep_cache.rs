@@ -54,12 +54,28 @@ impl DepCache {
   }
 
   /// Record that `name` in `scope` was built from `key`, producing `lib`.
-  pub fn insert(&mut self, scope: &str, name: &str, key: String, lib: PathBuf) {
+  /// Returns whether the entry changed, so an all-hit build can skip the save.
+  pub fn insert(
+    &mut self,
+    scope: &str,
+    name: &str,
+    key: String,
+    lib: PathBuf,
+  ) -> bool {
+    if self
+      .projects
+      .get(scope)
+      .and_then(|m| m.get(name))
+      .is_some_and(|c| c.key == key && c.lib == lib)
+    {
+      return false;
+    }
     self
       .projects
       .entry(scope.to_string())
       .or_default()
       .insert(name.to_string(), CachedDep { key, lib });
+    true
   }
 
   /// Load the cache rooted at `base`, or an empty cache if it is absent or
@@ -90,6 +106,15 @@ impl DepCache {
 mod tests {
   use super::DepCache;
   use std::path::PathBuf;
+
+  #[test]
+  fn insert_reports_whether_the_entry_changed() {
+    let existing = std::env::current_exe().unwrap();
+    let mut cache = DepCache::default();
+    assert!(cache.insert(".", "dep", "k1".into(), existing.clone()));
+    assert!(!cache.insert(".", "dep", "k1".into(), existing.clone()));
+    assert!(cache.insert(".", "dep", "k2".into(), existing));
+  }
 
   #[test]
   fn hit_keyed_by_scope_name_and_key() {

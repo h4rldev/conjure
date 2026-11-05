@@ -55,8 +55,18 @@ pub struct Ui {
 }
 
 impl Ui {
+  fn joined<S: AsRef<OsStr>>(args: &[S]) -> String {
+    args
+      .iter()
+      .map(|a| a.as_ref().to_string_lossy())
+      .collect::<Vec<_>>()
+      .join(" ")
+  }
+
   /// The only fallible primitive: spawn `args` in `dir` with `env`, forward
-  /// both streams, and return `None` on exit 0 or the exit code otherwise.
+  /// both streams, and return `None` on exit 0 or a nonzero exit code
+  /// otherwise. A signal-killed child has no exit code, so map that case to 1
+  /// rather than letting it read as success.
   ///
   /// `env` is layered on top of the inherited environment. It exists for the
   /// MSVC toolchain, whose `cl`/`link.exe` need `PATH`/`INCLUDE`/`LIB` captured
@@ -67,14 +77,11 @@ impl Ui {
     args: &[S],
     env: &[(OsString, OsString)],
   ) -> Result<Option<i32>> {
-    let joined = args
-      .iter()
-      .map(|a| a.as_ref().to_string_lossy())
-      .collect::<Vec<_>>()
-      .join(" ");
-
     if self.verbose > 0 {
-      self.println(None, format!("(cd {} && {joined})", dir.display()))?;
+      self.println(
+        None,
+        format!("(cd {} && {})", dir.display(), Self::joined(args)),
+      )?;
       if self.verbose > 1 {
         for (k, v) in env {
           self.println(
@@ -99,7 +106,8 @@ impl Ui {
       .map_err(|e| {
         miette::miette!(
           help = "Is it in path?",
-          "Failed to run `{joined}`: {e}"
+          "Failed to run `{}`: {e}",
+          Self::joined(args)
         )
       })?;
 
@@ -125,7 +133,7 @@ impl Ui {
     if status.success() {
       Ok(None)
     } else {
-      Ok(status.code())
+      Ok(Some(status.code().unwrap_or(1)))
     }
   }
 
@@ -249,15 +257,10 @@ impl Ui {
     args: &[S],
     env: &[(OsString, OsString)],
   ) -> Result<()> {
-    let joined = args
-      .iter()
-      .map(|a| a.as_ref().to_string_lossy())
-      .collect::<Vec<_>>()
-      .join(" ");
-
     match self.run(dir, args, env)? {
       None => Ok(()),
       Some(code) => {
+        let joined = Self::joined(args);
         let inner = miette::miette!(
           help = "Check the output above for more information",
           "`{joined}` failed in {} with exit status: {}",
@@ -344,5 +347,19 @@ pub fn mark(status: Option<&StepStatus>, msg: &str) -> String {
     Some(StepStatus::Failure) => format!("{} {}", "✗".red().bold(), msg),
     Some(StepStatus::Info) => format!("{} {}", "ℹ".cyan().bold(), msg),
     None => msg.to_string(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::Ui;
+  use std::path::Path;
+
+  #[test]
+  #[cfg(unix)]
+  fn signal_killed_child_is_a_failure() {
+    let ui = Ui::new();
+    let result = ui.exec(Path::new("."), &["sh", "-c", "kill -TERM $$"]);
+    assert!(result.is_err());
   }
 }

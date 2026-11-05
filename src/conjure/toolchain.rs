@@ -17,6 +17,7 @@ use super::proj_parse::{Arch, Compile, Language};
 use miette::{Context, IntoDiagnostic, Result};
 use std::{
   ffi::OsString,
+  fs,
   path::{Path, PathBuf},
   process::Command,
   sync::OnceLock,
@@ -65,6 +66,14 @@ pub trait Driver {
   fn default_linker(&self, cc: &[String]) -> Result<String>;
   fn raw_link_args(&self, cc: &[String], job: &LinkJob) -> Result<Vec<String>>;
 
+  /// Extra linker args for a shared link. MSVC generates a `.def` from the
+  /// objects; other drivers need nothing.
+  fn export_all_args(
+    &self,
+    dir: &Path,
+    objects: &[PathBuf],
+    out: &Path,
+  ) -> Result<Vec<String>>;
   /// The transient depfile for `obj` and the flags that make the compiler write
   /// it (this object's header dependencies).
   fn depfile(&self, obj: &str) -> (String, Vec<String>);
@@ -339,6 +348,7 @@ impl Driver for Gnu {
       + &String::from_utf8_lossy(&out.stderr);
     parse_link_line(&text)
   }
+
   fn default_linker(&self, cc: &[String]) -> Result<String> {
     let out = Command::new(&cc[0])
       .args(&cc[1..])
@@ -374,6 +384,15 @@ impl Driver for Gnu {
     argv.push("-o".into());
     argv.push(job.out.to_string());
     Ok(argv)
+  }
+
+  fn export_all_args(
+    &self,
+    _dir: &Path,
+    _objects: &[PathBuf],
+    _out: &Path,
+  ) -> Result<Vec<String>> {
+    Ok(Vec::new())
   }
 
   fn depfile(&self, obj: &str) -> (String, Vec<String>) {
@@ -549,6 +568,68 @@ fn msvc_env(arch: Arch) -> &'static [(OsString, OsString)] {
   })
 }
 
+/// Parse the `External` symbol lines from `dumpbin /symbols`. The bool is
+/// `true` for data symbols: dumpbin omits the `()` type marker for data.
+fn parse_export_symbols(text: &str, arch: Arch) -> Vec<(String, bool)> {
+  let mut out = Vec::new();
+  for line in text.lines() {
+    let Some((left, right)) = line.split_once('|') else {
+      continue;
+    };
+
+    let fields: Vec<&str> = left.split_whitespace().collect();
+    if !fields.contains(&"External")
+      || !fields.iter().any(|f| f.starts_with("SECT"))
+    {
+      continue;
+    }
+
+    let Some(symbol) = right.split_whitespace().next() else {
+      continue;
+    };
+
+    let mut name = symbol.to_string();
+
+    // x86 decorates C names as `_name` / `_name@N`; DEF entries are
+    // undecorated.
+    if name.starts_with('_')
+      && let Some(at) = name.find('@')
+    {
+      name.truncate(at);
+    }
+
+    if arch == Arch::X86 && name.starts_with('_') {
+      name.remove(0);
+    }
+
+    // Compiler bookkeeping, constants, and deleting destructors are not API.
+    if name.is_empty()
+      || name.contains('.')
+      || name.starts_with("??_G")
+      || name.starts_with("??_E")
+    {
+      continue;
+    }
+    out.push((name, !fields.contains(&"()")));
+  }
+  out
+}
+
+fn export_def(symbols: &[(String, bool)]) -> String {
+  let mut out = String::from("EXPORTS\n");
+  for (name, data) in symbols {
+    if *data {
+      out.push_str(&format!("\t{name} DATA\n"));
+    }
+  }
+  for (name, data) in symbols {
+    if !*data {
+      out.push_str(&format!("\t{name}\n"));
+    }
+  }
+  out
+}
+
 #[derive(Debug, Default)]
 pub struct Microsoft {
   arch: Arch,
@@ -684,6 +765,54 @@ impl Driver for Microsoft {
     Ok(argv)
   }
 
+  fn export_all_args(
+    &self,
+    dir: &Path,
+    objects: &[PathBuf],
+    out: &Path,
+  ) -> Result<Vec<String>> {
+    let mut symbols = Vec::new();
+    for object in objects {
+      let output = Command::new("dumpbin")
+        .args(["/nologo", "/symbols"])
+        .arg(object)
+        .current_dir(dir)
+        .envs(self.env().iter().cloned())
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+          format!("Failed to run dumpbin on {}", object.display())
+        })?;
+      if !output.status.success() {
+        return Err(miette::miette!(
+          "dumpbin failed on {}: {}",
+          object.display(),
+          String::from_utf8_lossy(&output.stderr).trim()
+        ));
+      }
+      symbols.extend(parse_export_symbols(
+        &String::from_utf8_lossy(&output.stdout),
+        self.arch,
+      ));
+    }
+    if symbols.is_empty() {
+      return Ok(Vec::new());
+    }
+    symbols.sort_by(|a, b| a.0.cmp(&b.0));
+    symbols.dedup_by(|a, b| a.0 == b.0);
+
+    let def = out.with_extension("def");
+    let path = if def.is_absolute() {
+      def.clone()
+    } else {
+      dir.join(&def)
+    };
+    fs::write(&path, export_def(&symbols))
+      .into_diagnostic()
+      .wrap_err_with(|| format!("Failed to write {}", path.display()))?;
+    Ok(vec![format!("/DEF:{}", def.display())])
+  }
+
   fn depfile(&self, obj: &str) -> (String, Vec<String>) {
     let dep = format!("{obj}.json");
     (dep.clone(), vec!["/sourceDependencies".into(), dep])
@@ -785,6 +914,15 @@ impl Toolchain {
     self.driver.raw_link_args(self.cc.as_slice(), job)
   }
 
+  pub fn export_all_args(
+    &self,
+    dir: &Path,
+    objects: &[PathBuf],
+    out: &Path,
+  ) -> Result<Vec<String>> {
+    self.driver.export_all_args(dir, objects, out)
+  }
+
   pub fn depfile(&self, obj: &str) -> (String, Vec<String>) {
     self.driver.depfile(obj)
   }
@@ -875,7 +1013,8 @@ pub fn resolve(compile: &Compile, language: &Language) -> Toolchain {
 mod tests {
   use super::{
     Arch, Compile, Driver, Gnu, Language, LinkJob, Microsoft, Toolchain,
-    driver_for, parse_link_line, parse_set, real_tool, resolve, words,
+    driver_for, export_def, parse_export_symbols, parse_link_line, parse_set,
+    real_tool, resolve, words,
   };
   use std::path::PathBuf;
 
@@ -915,6 +1054,39 @@ gcc version 15.3.0\n\
       ]
     );
     assert_eq!(suffix, vec!["-lgcc", "/lib64/crtendS.o", "/lib64/crtn.o"]);
+  }
+
+  #[test]
+  fn dumpbin_exports_are_parsed() {
+    let text = "\
+00A 00000000 SECT4  notype       External     | global
+00B 00000000 SECT3  notype ()    External     | func
+00C 00000000 UNDEF  notype ()    External     | imported
+00D 00000000 SECT5  notype ()    External     | ??_Gfoo@@YAXXZ
+";
+    assert_eq!(
+      parse_export_symbols(text, Arch::X86_64),
+      vec![("global".into(), true), ("func".into(), false)]
+    );
+    let x86 = "\
+00A 00000000 SECT3  notype ()    External     | _func
+00B 00000000 SECT3  notype ()    External     | _stdcall@8
+00C 00000000 SECT4  notype       External     | _data
+";
+    assert_eq!(
+      parse_export_symbols(x86, Arch::X86),
+      vec![
+        ("func".into(), false),
+        ("stdcall".into(), false),
+        ("data".into(), true),
+      ]
+    );
+  }
+
+  #[test]
+  fn export_def_marks_data_first() {
+    let def = export_def(&[("global".into(), true), ("func".into(), false)]);
+    assert_eq!(def, "EXPORTS\n\tglobal DATA\n\tfunc\n");
   }
 
   #[test]

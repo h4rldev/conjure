@@ -59,8 +59,10 @@ pub fn find_sources(
     path: dir.to_path_buf(),
     source,
   })? {
-    let p = entry.into_diagnostic()?.path();
-    if p.is_dir() {
+    let entry = entry.into_diagnostic()?;
+    let ft = entry.file_type().into_diagnostic()?;
+    let p = entry.path();
+    if ft.is_dir() || (ft.is_symlink() && p.is_dir()) {
       find_sources(&p, exts, out)?;
     } else if exts.is_empty()
       || p
@@ -117,6 +119,7 @@ pub fn compile_entries(
   cache_root: &Path,
   project: &Project,
   profile_name: &str,
+  obj_namespace: Option<&str>,
   pkg_cflags: Vec<String>,
   depfiles: bool,
 ) -> Result<Vec<(PathBuf, CompileEntry)>> {
@@ -152,17 +155,42 @@ pub fn compile_entries(
     .map(Flags::list)
     .unwrap_or_default();
 
-  let obj_dir = root
+  let mut obj_dir = root
     .join(".conjure")
     .join("build")
     .join("obj")
     .join(profile_name);
+  if let Some(namespace) = obj_namespace {
+    obj_dir.push(namespace);
+  }
 
   fs::create_dir_all(&obj_dir).into_diagnostic()?;
 
   let tc = toolchain::resolve(compile, &project.language);
   // Objects feeding a shared library must be position-independent.
   let shared_objs = project.is_library() && !project.want_static();
+
+  let mut common = tc.cc.clone();
+  common.extend(tc.arch_flags());
+  if let Some(std) = &compile.standard {
+    common.extend(tc.std_args(std));
+  }
+
+  common.extend(tc.default_c_flags(&project.language));
+  for dir in dep_include_dirs(project, root, cache_root) {
+    common.push(tc.include_arg(&dir.display().to_string()));
+  }
+
+  common.extend(pkg_cflags.iter().filter(|s| !s.is_empty()).cloned());
+  if let Some(include) = &compile.include {
+    common.extend(include.list().into_iter().map(|dir| tc.include_arg(&dir)));
+  }
+
+  if shared_objs && let Some(pic) = tc.pic_flag() {
+    common.push(pic);
+  }
+
+  common.extend(c_flags.iter().filter(|s| !s.is_empty()).cloned());
 
   sources
     .into_iter()
@@ -175,29 +203,7 @@ pub fn compile_entries(
 
       let obj = obj_dir.join(&rel).with_extension(tc.obj_ext());
 
-      let mut arguments = tc.cc.clone();
-      arguments.extend(tc.arch_flags());
-      if let Some(std) = &compile.standard {
-        arguments.extend(tc.std_args(std));
-      }
-
-      arguments.extend(tc.default_c_flags(&project.language));
-
-      for dir in dep_include_dirs(project, root, cache_root) {
-        arguments.push(tc.include_arg(&dir.display().to_string()));
-      }
-
-      arguments.extend(pkg_cflags.iter().filter(|s| !s.is_empty()).cloned());
-      if let Some(include) = &compile.include {
-        arguments
-          .extend(include.list().into_iter().map(|dir| tc.include_arg(&dir)));
-      }
-
-      if shared_objs && let Some(pic) = tc.pic_flag() {
-        arguments.push(pic);
-      }
-
-      arguments.extend(c_flags.iter().filter(|s| !s.is_empty()).cloned());
+      let mut arguments = common.clone();
       if depfiles {
         arguments.extend(tc.depfile(&obj.display().to_string()).1);
       }
@@ -296,7 +302,7 @@ pub fn compile_commands(
     let name = resolved.map_or("default", |(n, _)| n);
     let effective = proj.with_profile(resolved.map(|(_, p)| p));
     entries.extend(
-      compile_entries(&dir, &root, &effective, name, vec![], false)?
+      compile_entries(&dir, &root, &effective, name, None, vec![], false)?
         .into_iter()
         .map(|(_, e)| e),
     );
@@ -312,9 +318,17 @@ pub fn compile_commands(
         let test_out = test_resolved.map_or("default", |(n, _)| n);
         let test_eff = test_proj.with_profile(test_resolved.map(|(_, p)| p));
         entries.extend(
-          compile_entries(&dir, &root, &test_eff, test_out, vec![], false)?
-            .into_iter()
-            .map(|(_, e)| e),
+          compile_entries(
+            &dir,
+            &root,
+            &test_eff,
+            test_out,
+            Some(test_name),
+            vec![],
+            false,
+          )?
+          .into_iter()
+          .map(|(_, e)| e),
         );
       }
     }
@@ -334,6 +348,25 @@ pub fn compile_commands(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[cfg(unix)]
+  #[test]
+  fn find_sources_follows_directory_symlinks() {
+    let dir = std::env::temp_dir()
+      .join(format!("conjure_fs_link_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    std::fs::write(dir.join("real/a.c"), "").unwrap();
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+
+    let mut out = vec![];
+    find_sources(&dir, C_SRCS, &mut out).unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().any(|p| p.ends_with("real/a.c")));
+    assert!(out.iter().any(|p| p.ends_with("link/a.c")));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 
   #[test]
   fn find_sources_filters_by_extension() {

@@ -18,6 +18,9 @@ replacing them.
 - Profiles that can override far more than flags: `type`, `link`, `cc`,
   `linker`, `standard`, `arch`, sources, includes, dependencies, and the
   artifact name, and that can inherit from others with `extends`.
+- Exact artifact paths: `output.name` writes a literal, unscoped filename for
+  plugin artifacts (NIFs, Python/Ruby/Lua extensions), and `output` can be
+  overridden per profile.
 - Dependencies from local paths or git remotes (Codeberg, GitHub, Bitbucket, or
   any URL), pinned in a lockfile and cached per project scope.
 - Build-system interop: Make, CMake, Autotools, Meson, Ninja, Xmake, Just, a
@@ -25,12 +28,17 @@ replacing them.
 - Toolchain support for GCC/Clang and every GCC-cli-compatible compiler
   (including cross compilers, `zig cc`, `tcc`, MinGW-w64), plus MSVC (`cl` /
   `clang-cl`); shared libraries emit import libraries on MSVC.
+- Opt-in MSVC auto-export: `compile.export_all` reads object symbols with
+  `dumpbin` and generates a `.def`, so a shared library exports its public
+  symbols without `__declspec(dllexport)`.
 - `compile_commands.json` generation for clangd.
 - pkg-config file (`.pc`) generation for libraries, relocatable and on by
   default (`generate_pc #false` to disable).
-- Test targets (`tests { ... }`) built by `conjure test`; each links the
-  project's library, and test sources stay out of the normal build (they also
-  get their own clangd entries).
+- pkg-config inputs: `compile.pkg_config` resolves project and dependency
+  packages into compiler and linker flags.
+- Test targets (`tests { ... }`) built by `conjure test` in parallel; each
+  links the project's library, and test sources stay out of the normal build
+  (they also get their own clangd entries).
 - Target architecture selection (`x86_64`, `x64`, `arm64`).
 
 ## Installation

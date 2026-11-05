@@ -58,7 +58,7 @@
           openssl
           cmake
 
-          cargo-llvm-cov
+          # cargo-llvm-cov
 
           ### For the test project.
           mold
